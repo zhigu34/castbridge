@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 RECEIVER_NAME="${CASTBRIDGE_RECEIVER_NAME:-CastBridge}"
 AIRPLAY_PORT="${CASTBRIDGE_AIRPLAY_PORT:-7100}"
+AIRPLAY_FPS="${CASTBRIDGE_AIRPLAY_FPS:-60}"
 VIDEO_RTP_PORT="${CASTBRIDGE_RTP_VIDEO_PORT:-5000}"
 AUDIO_RTP_PORT="${CASTBRIDGE_RTP_AUDIO_PORT:-5002}"
 MDNS_MODE_REQUESTED="${CASTBRIDGE_MDNS_MODE:-auto}"
@@ -32,6 +33,16 @@ validate_port() {
   }
 }
 
+validate_fps() {
+  case "$AIRPLAY_FPS" in
+    ''|*[!0-9]*) echo "CASTBRIDGE_AIRPLAY_FPS 不是有效帧率: $AIRPLAY_FPS" >&2; exit 2 ;;
+  esac
+  [ "$AIRPLAY_FPS" -ge 1 ] && [ "$AIRPLAY_FPS" -le 255 ] || {
+    echo "CASTBRIDGE_AIRPLAY_FPS 必须在 1-255 范围内: $AIRPLAY_FPS" >&2
+    exit 2
+  }
+}
+
 validate_mdns_mode() {
   case "$MDNS_MODE_REQUESTED" in
     auto|host|embedded) ;;
@@ -45,6 +56,7 @@ validate_mdns_mode() {
 validate_port CASTBRIDGE_AIRPLAY_PORT "$AIRPLAY_PORT"
 validate_port CASTBRIDGE_RTP_VIDEO_PORT "$VIDEO_RTP_PORT"
 validate_port CASTBRIDGE_RTP_AUDIO_PORT "$AUDIO_RTP_PORT"
+validate_fps
 validate_mdns_mode
 
 write_status() {
@@ -58,6 +70,7 @@ write_status() {
     --argjson timestamp_epoch "$(date +%s)" \
     --argjson pid "${UXPLAY_PID:-0}" \
     --argjson airplay_port "$AIRPLAY_PORT" \
+    --argjson max_fps "$AIRPLAY_FPS" \
     --argjson video_rtp_port "$VIDEO_RTP_PORT" \
     --argjson audio_rtp_port "$AUDIO_RTP_PORT" \
     --argjson discovery_ready "$DISCOVERY_READY" \
@@ -73,6 +86,7 @@ write_status() {
       timestamp_epoch: $timestamp_epoch,
       pid: $pid,
       airplay_port: $airplay_port,
+      max_fps: $max_fps,
       video_rtp_port: $video_rtp_port,
       audio_rtp_port: $audio_rtp_port,
       exit_code: (if $exit_code == "" then null else ($exit_code | tonumber) end)
@@ -191,6 +205,7 @@ AUDIO_PIPELINE="pt=96 ! udpsink host=127.0.0.1 port=${AUDIO_RTP_PORT} sync=false
 
 printf '[receiver] 启动 UxPlay %s，设备名: %s\n' "${UXPLAY_VERSION:-1.73.7}" "$RECEIVER_NAME"
 printf '[receiver] AirPlay TCP/UDP 端口: %s-%s\n' "$AIRPLAY_PORT" "$((AIRPLAY_PORT + 2))"
+printf '[receiver] AirPlay 最大帧率: %s fps\n' "$AIRPLAY_FPS"
 printf '[receiver] RTP 输出: video=%s audio=%s\n' "$VIDEO_RTP_PORT" "$AUDIO_RTP_PORT"
 printf '[receiver] mDNS 请求模式: %s\n' "$MDNS_MODE_REQUESTED"
 
@@ -201,6 +216,7 @@ write_status starting
   -n "$RECEIVER_NAME" \
   -nh \
   -p "$AIRPLAY_PORT" \
+  -fps "$AIRPLAY_FPS" \
   -vrtp "$VIDEO_PIPELINE" \
   -artp "$AUDIO_PIPELINE" \
   > >(tee -a "$LOG_FILE") 2>&1 &
