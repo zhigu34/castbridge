@@ -30,7 +30,6 @@ class MediaBridge:
         self.run_dir = run_dir
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
-        self.loop = asyncio.get_running_loop()
         self.websocket: Any = None
         self.pipeline: Gst.Pipeline | None = None
         self.webrtc: Gst.Element | None = None
@@ -87,12 +86,16 @@ class MediaBridge:
 
     async def status_loop(self) -> None:
         context = GLib.MainContext.default()
+        last_status_write = 0.0
         while self.running:
             while context.pending():
                 context.iteration(False)
             self.poll_bus()
-            self.write_status()
-            await asyncio.sleep(0.05)
+            now = time.monotonic()
+            if now - last_status_write >= 1.0:
+                self.write_status()
+                last_status_write = now
+            await asyncio.sleep(0.02)
 
     def poll_bus(self) -> None:
         if self.pipeline is None:
