@@ -38,6 +38,14 @@ type Media = {
   engine: string
   video_rtp_port: number | null
   jitter_latency_ms?: number | null
+  retime_mode?: string | null
+  retimed_au_buffers?: number | null
+  retime_push_failures?: number | null
+  source_idr_count?: number | null
+  source_sps_count?: number | null
+  source_pps_count?: number | null
+  last_idr_age_seconds?: number | null
+  force_key_unit_events?: number | null
   input_fps?: number | null
   input_mbps?: number | null
   input_rtp_clock_ratio?: number | null
@@ -197,6 +205,20 @@ const streamStateText = computed(() => {
   return media.value?.message || 'Media Bridge 检测中'
 })
 const diagnosticHint = computed(() => {
+  const sourceIdrCount = media.value?.source_idr_count ?? 0
+  const forceKeyUnitEvents = media.value?.force_key_unit_events ?? 0
+  const lastIdrAge = media.value?.last_idr_age_seconds
+
+  if (webrtcState.value === 'connected' && packetsReceived.value > 0 && framesDecoded.value <= 1 && pliCount.value >= 20) {
+    if (sourceIdrCount <= 1 && forceKeyUnitEvents > 0) {
+      return `浏览器持续请求关键帧（PLI ${pliCount.value}），Bridge 已收到 ${forceKeyUnitEvents} 次 ForceKeyUnit，但源端 IDR 仅 ${sourceIdrCount} 个`
+    }
+    if (sourceIdrCount > 1) {
+      return `源端已出现 ${sourceIdrCount} 个 IDR，但浏览器仍无法恢复解码，优先检查 AU 完整性 / SPS-PPS / RTP 封装`
+    }
+    return `浏览器持续请求关键帧（PLI ${pliCount.value}），当前源端 IDR ${sourceIdrCount} 个${lastIdrAge == null ? '' : `，最近 IDR ${lastIdrAge.toFixed(1)}s 前`}`
+  }
+
   if (webrtcState.value === 'connected' && packetsReceived.value > 0 && framesDecoded.value === 0) {
     return 'RTP 已到达，但 H.264 尚未产生解码帧'
   }
@@ -205,13 +227,14 @@ const diagnosticHint = computed(() => {
   if (decodeMsPerFrame.value >= 20) return '单帧解码耗时偏高，可能存在解码性能压力'
 
   const inputClock = media.value?.input_rtp_clock_ratio ?? 0
+  const inputClockChanges = media.value?.input_rtp_timestamp_changes ?? 0
   const parserClock = media.value?.parser_pts_clock_ratio ?? 0
   const outputClock = media.value?.output_rtp_clock_ratio ?? 0
-  if (inputClock > 0 && Math.abs(inputClock - 1) > 0.08) {
+  if (inputClockChanges >= 8 && inputClock > 0 && Math.abs(inputClock - 1) > 0.08) {
     return `UxPlay 输入 RTP 时间轴速度异常：${inputClock.toFixed(3)}× 实时`
   }
-  if (inputClock > 0 && Math.abs(inputClock - 1) <= 0.08 && parserClock > 0 && Math.abs(parserClock - 1) > 0.08) {
-    return `RTP 输入时钟正常，但 depay/parser PTS 速度异常：${parserClock.toFixed(3)}×`
+  if (parserClock > 0 && Math.abs(parserClock - 1) > 0.08) {
+    return `AU 重建后的 Parser PTS 速度异常：${parserClock.toFixed(3)}×`
   }
   if (parserClock > 0 && Math.abs(parserClock - 1) <= 0.08 && outputClock > 0 && Math.abs(outputClock - 1) > 0.08) {
     return `Parser PTS 正常，但 Media Bridge 输出 RTP 时钟异常：${outputClock.toFixed(3)}×`
@@ -226,7 +249,7 @@ const diagnosticHint = computed(() => {
   if (receiveFps.value >= 30 && decodeFps.value + 8 < receiveFps.value) return 'WebRTC 已收到视频帧，但浏览器解码速度明显落后'
   if (decodeFps.value >= 30 && presentedFps.value > 0 && presentedFps.value + 8 < decodeFps.value) return '浏览器已解码，但实际呈现帧率明显落后'
   if (decodeFps.value > 0 && decodeFps.value < 20) return '解码帧率偏低'
-  if (webrtcState.value === 'connected' && framesDecoded.value > 0) return '视频链路工作中，时钟比率接近 1.000× 时才属于正常时间轴'
+  if (webrtcState.value === 'connected' && framesDecoded.value > 0) return '视频链路工作中，重点观察源 IDR、ForceKeyUnit、PLI 与 AU retime 是否同步'
   return '等待 WebRTC 视频统计'
 })
 const diagnosticText = computed(() => JSON.stringify({
@@ -247,6 +270,14 @@ const diagnosticText = computed(() => JSON.stringify({
     buffers: media.value?.buffers ?? 0,
     bytes: media.value?.bytes ?? 0,
     jitter_latency_ms: media.value?.jitter_latency_ms ?? null,
+    retime_mode: media.value?.retime_mode ?? null,
+    retimed_au_buffers: media.value?.retimed_au_buffers ?? 0,
+    retime_push_failures: media.value?.retime_push_failures ?? 0,
+    source_idr_count: media.value?.source_idr_count ?? 0,
+    source_sps_count: media.value?.source_sps_count ?? 0,
+    source_pps_count: media.value?.source_pps_count ?? 0,
+    last_idr_age_seconds: media.value?.last_idr_age_seconds ?? null,
+    force_key_unit_events: media.value?.force_key_unit_events ?? 0,
     input_fps: Number((media.value?.input_fps ?? 0).toFixed(1)),
     input_mbps: Number((media.value?.input_mbps ?? 0).toFixed(3)),
     input_rtp_clock_ratio: Number((media.value?.input_rtp_clock_ratio ?? 0).toFixed(4)),
@@ -732,6 +763,10 @@ onBeforeUnmount(() => {
           <article><span>WebRTC 接收 FPS</span><strong>{{ receiveFps.toFixed(1) }}</strong></article>
           <article><span>解码 FPS</span><strong>{{ decodeFps.toFixed(1) }}</strong></article>
           <article><span>实际呈现 FPS</span><strong>{{ presentedFps.toFixed(1) }}</strong></article>
+          <article><span>源 IDR</span><strong>{{ media?.source_idr_count ?? 0 }}</strong></article>
+          <article><span>源 SPS / PPS</span><strong>{{ media?.source_sps_count ?? 0 }} / {{ media?.source_pps_count ?? 0 }}</strong></article>
+          <article><span>最近 IDR</span><strong>{{ media?.last_idr_age_seconds == null ? '—' : `${media.last_idr_age_seconds.toFixed(1)}s 前` }}</strong></article>
+          <article><span>ForceKeyUnit</span><strong>{{ media?.force_key_unit_events ?? 0 }}</strong></article>
           <article><span>输入 RTP 时钟</span><strong>{{ (media?.input_rtp_clock_ratio ?? 0).toFixed(3) }}×</strong></article>
           <article><span>Parser PTS 时钟</span><strong>{{ (media?.parser_pts_clock_ratio ?? 0).toFixed(3) }}×</strong></article>
           <article><span>输出 RTP 时钟</span><strong>{{ (media?.output_rtp_clock_ratio ?? 0).toFixed(3) }}×</strong></article>
@@ -744,7 +779,7 @@ onBeforeUnmount(() => {
           <article><span>单帧解码</span><strong>{{ decodeMsPerFrame.toFixed(2) }} ms</strong></article>
           <article><span>处理耗时</span><strong>{{ processingMsPerFrame.toFixed(2) }} ms</strong></article>
           <article><span>RTT</span><strong>{{ rttMs.toFixed(1) }} ms</strong></article>
-          <article><span>关键帧</span><strong>{{ keyFramesDecoded }}</strong></article>
+          <article><span>关键帧解码</span><strong>{{ keyFramesDecoded }}</strong></article>
           <article><span>Freeze</span><strong>{{ freezeCount }} · {{ totalFreezesDuration.toFixed(1) }}s</strong></article>
           <article><span>NACK / PLI / FIR</span><strong>{{ nackCount }} / {{ pliCount }} / {{ firCount }}</strong></article>
         </div>
@@ -754,6 +789,7 @@ onBeforeUnmount(() => {
           <span><b>Decoder</b>{{ decoderImplementation }}{{ powerEfficientDecoder === null ? '' : powerEfficientDecoder ? ' · HW/高效' : ' · 非高效' }}</span>
           <span><b>ICE</b>{{ icePath }}</span>
           <span><b>Media</b>{{ (media?.input_mbps ?? 0).toFixed(2) }} Mbps · jitter {{ media?.jitter_latency_ms ?? '—' }} ms</span>
+          <span><b>AU retime</b>{{ media?.retimed_au_buffers ?? 0 }} ok · {{ media?.retime_push_failures ?? 0 }} fail</span>
           <span><b>RTP TS changes</b>{{ media?.input_rtp_timestamp_changes ?? 0 }} → {{ media?.output_rtp_timestamp_changes ?? 0 }}</span>
           <span><b>Parser PTS valid</b>{{ media?.parser_pts_valid_buffers ?? 0 }}</span>
           <span><b>RTP</b>{{ packetsPerSecond.toFixed(0) }} pkt/s</span>
