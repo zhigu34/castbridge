@@ -2,9 +2,9 @@ ARG DEBIAN_BASE_IMAGE=debian:bookworm-slim
 FROM ${DEBIAN_BASE_IMAGE} AS build
 
 ARG UXPLAY_VERSION=1.74
+ARG UXPLAY_ARCHIVE=vendor/uxplay/uxplay-v1.74.tar.gz
 ARG DEBIAN_MIRROR=
 ARG DEBIAN_SECURITY_MIRROR=
-ARG UXPLAY_SOURCE_URL=
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -31,7 +31,7 @@ RUN set -eux; \
         build-essential \
         ca-certificates \
         cmake \
-        curl \
+        gzip \
         libgstreamer-plugins-base1.0-dev \
         libgstreamer1.0-dev \
         libplist-dev \
@@ -40,11 +40,11 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src/uxplay
-
+COPY ${UXPLAY_ARCHIVE} /tmp/uxplay.tar.gz
 RUN set -eux; \
-    source_url="${UXPLAY_SOURCE_URL:-https://github.com/FDH2/UxPlay/archive/refs/tags/v${UXPLAY_VERSION}.tar.gz}"; \
-    curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 15 "${source_url}" \
-    | tar -xz --strip-components=1
+    tar -xzf /tmp/uxplay.tar.gz --strip-components=1; \
+    rm -f /tmp/uxplay.tar.gz; \
+    test -f CMakeLists.txt
 
 RUN cmake -S . -B build \
       -DCMAKE_BUILD_TYPE=Release \
