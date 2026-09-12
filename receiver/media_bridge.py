@@ -128,9 +128,6 @@ class MediaBridge:
     def schedule_send(self, message: dict[str, Any]) -> None:
         if self.loop.is_closed():
             return
-        # This method is called by both asyncio and GStreamer threads. Never
-        # call asyncio.create_task() directly here: streaming-thread callbacks
-        # do not have a running asyncio event loop.
         self.loop.call_soon_threadsafe(self._schedule_send_on_loop, message)
 
     def _schedule_send_on_loop(self, message: dict[str, Any]) -> None:
@@ -146,6 +143,18 @@ class MediaBridge:
             await websocket.send(json.dumps(message, ensure_ascii=False))
         except Exception as exc:
             print(f"[media] 信令发送失败: {exc}", flush=True)
+
+    def log_sdp_video(self, label: str, sdp_text: str) -> None:
+        interesting = []
+        for line in sdp_text.splitlines():
+            if line.startswith("m=video"):
+                interesting.append(line)
+            elif line.startswith("a=rtpmap:") and "H264" in line.upper():
+                interesting.append(line)
+            elif line.startswith("a=fmtp:"):
+                interesting.append(line)
+        if interesting:
+            print(f"[media] {label}: {' | '.join(interesting)}", flush=True)
 
     def on_ice_candidate(self, _element: Gst.Element, mlineindex: int, candidate: str) -> None:
         if not self.active_viewer:
@@ -168,12 +177,14 @@ class MediaBridge:
         if offer is None:
             self.last_error = "webrtcbin 未生成 SDP offer"
             return
+        offer_text = offer.sdp.as_text()
+        self.log_sdp_video("SDP offer video", offer_text)
         self.webrtc.emit("set-local-description", offer, Gst.Promise.new())
         self.schedule_send(
             {
                 "type": "webrtc.offer",
                 "viewer_id": self.active_viewer,
-                "sdp": offer.sdp.as_text(),
+                "sdp": offer_text,
             }
         )
         print(f"[media] 已向 viewer {self.active_viewer} 发送 SDP offer", flush=True)
@@ -200,14 +211,20 @@ class MediaBridge:
         self.active_viewer = viewer_id
         self.last_error = None
 
+        # UxPlay sends decrypted H.264 RTP. Normalize the elementary stream to
+        # AVC access units, then packetize it in WebRTC-friendly non-interleaved
+        # mode (packetization-mode=1). MTU 1200 avoids oversized UDP packets on
+        # common LAN/VPN paths while still keeping the stream zero-copy at the
+        # codec level (no decode/re-encode).
         description = (
             f'udpsrc port={self.video_port} '
             'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
             '! rtpjitterbuffer latency=50 drop-on-latency=true '
             '! rtph264depay '
             '! h264parse name=parser config-interval=-1 '
-            '! rtph264pay pt=96 config-interval=-1 aggregate-mode=zero-latency '
-            '! application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96 '
+            '! video/x-h264,stream-format=avc,alignment=au '
+            '! rtph264pay pt=96 mtu=1200 config-interval=-1 aggregate-mode=zero-latency '
+            '! application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96,packetization-mode=(string)1 '
             '! webrtcbin name=webrtc bundle-policy=max-bundle'
         )
         pipeline = Gst.parse_launch(description)
@@ -238,6 +255,7 @@ class MediaBridge:
     def apply_answer(self, sdp_text: str) -> None:
         if self.webrtc is None:
             return
+        self.log_sdp_video("SDP answer video", sdp_text)
         result, sdp = GstSdp.SDPMessage.new()
         if result != GstSdp.SDPResult.OK:
             raise RuntimeError("无法创建 SDP message")
