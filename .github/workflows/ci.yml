@@ -47,6 +47,7 @@ jobs:
         run: |
           bash -n deploy.sh
           bash -n receiver/entrypoint.sh
+          bash -n scripts/download-uxplay.sh
       - name: Validate Docker Compose
         run: cp .env.example .env && docker compose config >/dev/null
 
@@ -54,5 +55,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache UxPlay source archive
+        uses: actions/cache@v4
+        with:
+          path: vendor/uxplay/uxplay-v1.74.tar.gz
+          key: uxplay-source-v1.74
+      - name: Prepare UxPlay source archive
+        env:
+          GITHUB_PROXY_PROMPT: "0"
+        run: bash scripts/download-uxplay.sh 1.74
       - name: Build UxPlay receiver image
-        run: docker build --build-arg UXPLAY_VERSION=1.74 -f receiver/Dockerfile .
+        run: >-
+          docker build
+          --build-arg UXPLAY_VERSION=1.74
+          --build-arg UXPLAY_ARCHIVE=vendor/uxplay/uxplay-v1.74.tar.gz
+          -f receiver/Dockerfile .
