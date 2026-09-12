@@ -9,9 +9,11 @@ ENV_EXAMPLE="$ROOT_DIR/.env.example"
 BUILD_LOG="$ROOT_DIR/logs/deploy-build.log"
 UP_LOG="$ROOT_DIR/logs/deploy-up.log"
 PREFLIGHT_LOG="$ROOT_DIR/logs/deploy-preflight.log"
+BUILD_STATE_FILE="$ROOT_DIR/run/deploy-build-state.env"
 CHECK_ONLY=0
 NO_BUILD=0
 NO_UXPLAY_DOWNLOAD=0
+REBUILD_ALL=0
 
 info() { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
@@ -27,14 +29,22 @@ CastBridge 一键部署脚本
   ./deploy.sh [选项]
 
 选项:
-  --check-only          只做环境和配置检查，不构建、不启动
+  --check-only          只做环境、配置和增量构建计划检查，不构建、不启动
   --no-uxplay-download  UxPlay 本地源码包缺失时不联网下载
   --no-build            跳过镜像构建，直接启动现有镜像
+  --rebuild-all         忽略增量状态，强制重建 receiver/backend/frontend
   -h, --help            显示帮助
+
+默认采用按服务增量构建：
+  - receiver 构建输入未变化 -> 不重建 receiver
+  - backend 构建输入未变化  -> 不重建 backend
+  - frontend 构建输入未变化 -> 不重建 frontend
+  - 仅运行时 .env 变化由 docker compose up 处理，不会触发无关镜像重建
 
 可选环境变量:
   DEPLOY_AUTO_PULL=0       缺少基础镜像时不自动 docker pull（默认 1）
   DEPLOY_BUILD_VERBOSE=1   显示完整 Docker 构建输出（默认静默，仅失败时显示错误摘要）
+  DEPLOY_FORCE_BUILD=1     与 --rebuild-all 相同，强制重建全部服务镜像
   GITHUB_DOWNLOAD_PROXY    仅 UxPlay GitHub 下载使用的代理
   GITHUB_PROXY_PROMPT=0    禁止 UxPlay 下载时询问代理
 
@@ -48,11 +58,15 @@ while [ "$#" -gt 0 ]; do
     --check-only) CHECK_ONLY=1 ;;
     --no-uxplay-download) NO_UXPLAY_DOWNLOAD=1 ;;
     --no-build) NO_BUILD=1 ;;
+    --rebuild-all) REBUILD_ALL=1 ;;
     -h|--help) usage; exit 0 ;;
     *) fail "未知参数: $1（使用 --help 查看用法）" ;;
   esac
   shift
 done
+
+[ "${DEPLOY_FORCE_BUILD:-0}" != "1" ] || REBUILD_ALL=1
+[ "$NO_BUILD" = "0" ] || [ "$REBUILD_ALL" = "0" ] || fail "--no-build 与 --rebuild-all / DEPLOY_FORCE_BUILD=1 不能同时使用"
 
 env_get() {
   local key="$1"
@@ -183,6 +197,132 @@ prepare_uxplay() {
   ok "UxPlay 本地源码包准备完成"
 }
 
+sha256_file() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
+fingerprint_file() {
+  local file="$1" rel digest
+  rel="${file#$ROOT_DIR/}"
+  if [ -f "$file" ]; then
+    digest="$(sha256_file "$file")"
+    printf 'file:%s:%s\n' "$rel" "$digest"
+  else
+    printf 'missing:%s\n' "$rel"
+  fi
+}
+
+fingerprint_tree() {
+  local dir="$1" file
+  if [ ! -d "$dir" ]; then
+    printf 'missing-dir:%s\n' "${dir#$ROOT_DIR/}"
+    return 0
+  fi
+
+  while IFS= read -r -d '' file; do
+    fingerprint_file "$file"
+  done < <(
+    find "$dir" -type f \
+      ! -path '*/node_modules/*' \
+      ! -path '*/dist/*' \
+      ! -path '*/.venv/*' \
+      ! -path '*/venv/*' \
+      ! -path '*/__pycache__/*' \
+      ! -path '*/.pytest_cache/*' \
+      ! -path '*/.ruff_cache/*' \
+      ! -path '*/coverage/*' \
+      -print0 | sort -z
+  )
+}
+
+service_fingerprint() {
+  local service="$1" archive
+  {
+    printf 'fingerprint-version:2\n'
+    fingerprint_file "$ROOT_DIR/.dockerignore"
+    case "$service" in
+      receiver)
+        fingerprint_file "$ROOT_DIR/receiver/Dockerfile"
+        fingerprint_file "$ROOT_DIR/receiver/entrypoint.sh"
+        archive="$ROOT_DIR/vendor/uxplay/uxplay-v${UXPLAY_VERSION}.tar.gz"
+        fingerprint_file "$archive"
+        printf 'UXPLAY_VERSION=%s\n' "$UXPLAY_VERSION"
+        printf 'UXPLAY_SOURCE_URL=%s\n' "$(env_get UXPLAY_SOURCE_URL || true)"
+        printf 'UXPLAY_SHA256=%s\n' "$(env_get UXPLAY_SHA256 || true)"
+        printf 'DEBIAN_BASE_IMAGE=%s\n' "$DEBIAN_BASE_IMAGE"
+        printf 'DEBIAN_MIRROR=%s\n' "$(env_get DEBIAN_MIRROR)"
+        printf 'DEBIAN_SECURITY_MIRROR=%s\n' "$(env_get DEBIAN_SECURITY_MIRROR)"
+        ;;
+      backend)
+        fingerprint_file "$ROOT_DIR/backend/Dockerfile"
+        fingerprint_file "$ROOT_DIR/backend/pyproject.toml"
+        fingerprint_tree "$ROOT_DIR/backend/app"
+        printf 'PYTHON_BASE_IMAGE=%s\n' "$PYTHON_BASE_IMAGE"
+        printf 'PYPI_INDEX_URL=%s\n' "$(env_get PYPI_INDEX_URL)"
+        ;;
+      frontend)
+        fingerprint_tree "$ROOT_DIR/frontend"
+        printf 'NODE_BASE_IMAGE=%s\n' "$NODE_BASE_IMAGE"
+        printf 'NGINX_BASE_IMAGE=%s\n' "$NGINX_BASE_IMAGE"
+        printf 'NPM_REGISTRY=%s\n' "$(env_get NPM_REGISTRY)"
+        ;;
+      *) return 2 ;;
+    esac
+  } | sha256sum | awk '{print $1}'
+}
+
+state_get() {
+  local key="$1"
+  [ -f "$BUILD_STATE_FILE" ] || return 0
+  awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$BUILD_STATE_FILE"
+}
+
+write_build_state() {
+  local tmp="${BUILD_STATE_FILE}.tmp.$$"
+  {
+    printf 'receiver=%s\n' "$RECEIVER_FINGERPRINT"
+    printf 'backend=%s\n' "$BACKEND_FINGERPRINT"
+    printf 'frontend=%s\n' "$FRONTEND_FINGERPRINT"
+  } > "$tmp"
+  mv "$tmp" "$BUILD_STATE_FILE"
+}
+
+service_image_exists() {
+  local service="$1" image_id
+  image_id="$("${COMPOSE[@]}" images -q "$service" 2>/dev/null | head -n 1 || true)"
+  [ -n "$image_id" ] && docker image inspect "$image_id" >/dev/null 2>&1
+}
+
+plan_service_build() {
+  local service="$1" current="$2" previous reason=""
+  previous="$(state_get "$service")"
+
+  if [ "$REBUILD_ALL" = "1" ]; then
+    reason="强制重建"
+  elif ! service_image_exists "$service"; then
+    reason="镜像不存在"
+  elif [ -z "$previous" ]; then
+    reason="尚无增量构建状态"
+  elif [ "$current" != "$previous" ]; then
+    reason="构建输入已变化"
+  fi
+
+  if [ -n "$reason" ]; then
+    BUILD_SERVICES+=("$service")
+    info "$service: 需要重建（$reason）"
+  else
+    ok "$service: 无构建变更，复用现有镜像"
+  fi
+}
+
+service_selected() {
+  local target="$1" service
+  for service in "${BUILD_SERVICES[@]:-}"; do
+    [ "$service" = "$target" ] && return 0
+  done
+  return 1
+}
+
 port_in_use() {
   local port="$1"
   if command_exists ss; then
@@ -307,7 +447,7 @@ command_exists docker || fail "未安装 Docker"
 docker version >/dev/null 2>&1 || fail "Docker daemon 不可用"
 docker compose version >/dev/null 2>&1 || fail "需要 Docker Compose v2"
 docker buildx version >/dev/null 2>&1 || fail "需要 Docker Buildx"
-for cmd in awk grep df tar; do command_exists "$cmd" || fail "缺少命令: $cmd"; done
+for cmd in awk grep df tar find sort sha256sum; do command_exists "$cmd" || fail "缺少命令: $cmd"; done
 
 DOCKER_ARCH_RAW="$(docker info --format '{{.Architecture}}' 2>/dev/null || true)"
 DOCKER_ARCH="$(normalize_arch "$DOCKER_ARCH_RAW" 2>/dev/null || true)"
@@ -381,30 +521,56 @@ elif [ -n "$FREE_KB" ]; then
   ok "磁盘剩余空间: 约 $((FREE_KB / 1024 / 1024)) GiB"
 fi
 
-prepare_uxplay "$UXPLAY_VERSION"
-ensure_image "$PYTHON_BASE_IMAGE" "$DOCKER_ARCH"
-ensure_image "$NODE_BASE_IMAGE" "$DOCKER_ARCH"
-ensure_image "$NGINX_BASE_IMAGE" "$DOCKER_ARCH"
-ensure_image "$DEBIAN_BASE_IMAGE" "$DOCKER_ARCH"
-
 COMPOSE=(docker compose --env-file "$ENV_FILE")
 "${COMPOSE[@]}" config >/dev/null || fail "docker compose 配置校验失败"
 ok "docker compose config 校验通过"
 
+BUILD_SERVICES=()
+RECEIVER_FINGERPRINT="$(service_fingerprint receiver)"
+BACKEND_FINGERPRINT="$(service_fingerprint backend)"
+FRONTEND_FINGERPRINT="$(service_fingerprint frontend)"
+
+if [ "$NO_BUILD" = "0" ]; then
+  info "检查服务构建变更..."
+  plan_service_build receiver "$RECEIVER_FINGERPRINT"
+  plan_service_build backend "$BACKEND_FINGERPRINT"
+  plan_service_build frontend "$FRONTEND_FINGERPRINT"
+else
+  warn "已使用 --no-build，跳过增量构建检查"
+fi
+
 if [ "$CHECK_ONLY" = "1" ]; then
-  ok "检查完成（--check-only），未构建或启动服务"
+  if [ "$NO_BUILD" = "0" ] && [ "${#BUILD_SERVICES[@]}" -eq 0 ]; then
+    ok "增量构建计划：无需重建任何服务"
+  elif [ "$NO_BUILD" = "0" ]; then
+    info "增量构建计划: ${BUILD_SERVICES[*]}"
+  fi
+  ok "检查完成（--check-only），未下载源码、未拉取基础镜像、未构建或启动服务"
   exit 0
 fi
 
-if [ "$NO_BUILD" = "0" ]; then
+if [ "$NO_BUILD" = "0" ] && [ "${#BUILD_SERVICES[@]}" -gt 0 ]; then
+  if service_selected receiver; then
+    prepare_uxplay "$UXPLAY_VERSION"
+    RECEIVER_FINGERPRINT="$(service_fingerprint receiver)"
+    ensure_image "$DEBIAN_BASE_IMAGE" "$DOCKER_ARCH"
+  fi
+  if service_selected backend; then
+    ensure_image "$PYTHON_BASE_IMAGE" "$DOCKER_ARCH"
+  fi
+  if service_selected frontend; then
+    ensure_image "$NODE_BASE_IMAGE" "$DOCKER_ARCH"
+    ensure_image "$NGINX_BASE_IMAGE" "$DOCKER_ARCH"
+  fi
+
   BUILD_CMD=("${COMPOSE[@]}" build)
   if "${COMPOSE[@]}" build --help 2>/dev/null | grep -q -- '--builder'; then
     BUILD_CMD+=(--builder default)
   fi
-  BUILD_CMD+=(receiver backend frontend)
+  BUILD_CMD+=("${BUILD_SERVICES[@]}")
 
   : > "$BUILD_LOG"
-  info "开始构建 receiver/backend/frontend（默认静默，完整日志: logs/deploy-build.log）..."
+  info "开始增量构建: ${BUILD_SERVICES[*]}（完整日志: logs/deploy-build.log）..."
   set +e
   if [ "${DEPLOY_BUILD_VERBOSE:-0}" = "1" ]; then
     "${BUILD_CMD[@]}" 2>&1 | tee "$BUILD_LOG"
@@ -419,7 +585,14 @@ if [ "$NO_BUILD" = "0" ]; then
     show_error_summary "$BUILD_LOG" "镜像构建错误摘要"
     fail "镜像构建失败，完整日志: logs/deploy-build.log"
   fi
-  ok "receiver/backend/frontend 镜像构建完成"
+
+  RECEIVER_FINGERPRINT="$(service_fingerprint receiver)"
+  BACKEND_FINGERPRINT="$(service_fingerprint backend)"
+  FRONTEND_FINGERPRINT="$(service_fingerprint frontend)"
+  write_build_state
+  ok "增量镜像构建完成: ${BUILD_SERVICES[*]}"
+elif [ "$NO_BUILD" = "0" ]; then
+  ok "receiver/backend/frontend 均无构建变更，跳过镜像构建"
 else
   warn "已使用 --no-build，跳过镜像构建"
 fi
@@ -469,4 +642,5 @@ printf '局域网访问:     http://<本机IP>:%s\n' "$WEB_PORT"
 printf 'AirPlay 名称:   %s\n' "$RECEIVER_NAME"
 printf 'AirPlay 端口:   TCP/UDP %s-%s\n' "$AIRPLAY_PORT" "$((AIRPLAY_PORT + 2))"
 printf 'mDNS:           UDP 5353（宿主机防火墙需允许局域网访问）\n'
-printf 'UxPlay 源码:    vendor/uxplay/uxplay-v%s.tar.gz（本地缓存）\n' "$UXPLAY_VERSION"
+printf 'UxPlay 源码:    vendor/uxplay/uxplay-v%s.tar.gz（仅 Receiver 重建时检查）\n' "$UXPLAY_VERSION"
+printf '构建策略:       按服务指纹增量构建\n'
