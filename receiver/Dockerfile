@@ -8,7 +8,10 @@ ARG DEBIAN_SECURITY_MIRROR=
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN set -eux; \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    set -eux; \
+    rm -f /etc/apt/apt.conf.d/docker-clean; \
     if [ -n "${DEBIAN_MIRROR}" ]; then \
       if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
         sed -i \
@@ -37,8 +40,7 @@ RUN set -eux; \
         libgstreamer1.0-dev \
         libplist-dev \
         libssl-dev \
-        pkg-config; \
-    rm -rf /var/lib/apt/lists/*
+        pkg-config
 
 WORKDIR /src/uxplay
 COPY ${UXPLAY_ARCHIVE} /tmp/uxplay.tar.gz
@@ -63,7 +65,10 @@ ARG DEBIAN_SECURITY_MIRROR=
 ENV DEBIAN_FRONTEND=noninteractive \
     UXPLAY_VERSION=${UXPLAY_VERSION}
 
-RUN set -eux; \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    set -eux; \
+    rm -f /etc/apt/apt.conf.d/docker-clean; \
     if [ -n "${DEBIAN_MIRROR}" ]; then \
       if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
         sed -i \
@@ -98,8 +103,7 @@ RUN set -eux; \
         libplist3 \
         libssl3 \
         procps \
-        tzdata; \
-    rm -rf /var/lib/apt/lists/*
+        tzdata
 
 COPY --from=build /usr/local/bin/uxplay /usr/local/bin/uxplay
 COPY receiver/entrypoint.sh /usr/local/bin/castbridge-receiver
