@@ -494,20 +494,34 @@ ensure_env_key CASTBRIDGE_ENVIRONMENT production
 ensure_env_key CASTBRIDGE_RECEIVER_NAME CastBridge
 ensure_env_key CASTBRIDGE_LOG_LEVEL INFO
 ensure_env_key CASTBRIDGE_RECEIVER_STALE_SECONDS 10
-ensure_env_key UXPLAY_VERSION 1.74
+ensure_env_key UXPLAY_VERSION 1.73.7
 ensure_env_key UXPLAY_SOURCE_URL ""
 ensure_env_key UXPLAY_SHA256 ""
 ensure_env_key CASTBRIDGE_AIRPLAY_PORT 7100
 ensure_env_key CASTBRIDGE_RTP_VIDEO_PORT 5000
 ensure_env_key CASTBRIDGE_RTP_AUDIO_PORT 5002
-ensure_env_key DEBIAN_MIRROR http://mirrors.aliyun.com/debian
-ensure_env_key DEBIAN_SECURITY_MIRROR http://mirrors.aliyun.com/debian-security
+ensure_env_key CASTBRIDGE_MDNS_MODE auto
+ensure_env_key DEBIAN_MIRROR http://mirrors.tuna.tsinghua.edu.cn/debian
+ensure_env_key DEBIAN_SECURITY_MIRROR http://mirrors.tuna.tsinghua.edu.cn/debian-security
 ensure_env_key PYPI_INDEX_URL https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 ensure_env_key NPM_REGISTRY https://registry.npmmirror.com
 ensure_env_key DEBIAN_BASE_IMAGE debian:bookworm-slim
 ensure_env_key PYTHON_BASE_IMAGE python:3.12-slim
 ensure_env_key NODE_BASE_IMAGE node:22-alpine
 ensure_env_key NGINX_BASE_IMAGE nginx:1.27-alpine
+
+case "$(env_get DEBIAN_MIRROR || true)" in
+  http://mirrors.aliyun.com/debian|https://mirrors.aliyun.com/debian)
+    env_set DEBIAN_MIRROR http://mirrors.tuna.tsinghua.edu.cn/debian
+    info "检测到旧默认阿里 Debian 镜像，已自动迁移到清华 TUNA"
+    ;;
+esac
+case "$(env_get DEBIAN_SECURITY_MIRROR || true)" in
+  http://mirrors.aliyun.com/debian-security|https://mirrors.aliyun.com/debian-security)
+    env_set DEBIAN_SECURITY_MIRROR http://mirrors.tuna.tsinghua.edu.cn/debian-security
+    info "检测到旧默认阿里 Debian Security 镜像，已自动迁移到清华 TUNA"
+    ;;
+esac
 
 WEB_PORT="$(env_get CASTBRIDGE_WEB_PORT)"
 AIRPLAY_PORT="$(env_get CASTBRIDGE_AIRPLAY_PORT)"
