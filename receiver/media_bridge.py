@@ -28,7 +28,7 @@ OFFER_PROFILE_WAIT_SECONDS = 1.5
 class MediaBridge:
     def __init__(self) -> None:
         self.video_port = int(os.getenv("CASTBRIDGE_RTP_VIDEO_PORT", "5000"))
-        self.jitter_latency_ms = int(os.getenv("CASTBRIDGE_RTP_JITTER_MS", "10"))
+        self.jitter_latency_ms = int(os.getenv("CASTBRIDGE_RTP_JITTER_MS", "50"))
         if self.jitter_latency_ms < 0 or self.jitter_latency_ms > 1000:
             raise ValueError("CASTBRIDGE_RTP_JITTER_MS 必须在 0-1000 范围内")
         self.signaling_url = os.getenv(
@@ -561,7 +561,7 @@ class MediaBridge:
         description = (
             f'udpsrc name=rtpin port={self.video_port} '
             'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
-            f'! rtpjitterbuffer latency={self.jitter_latency_ms} drop-on-latency=true '
+            f'! rtpjitterbuffer latency={self.jitter_latency_ms} drop-on-latency=false '
             '! rtph264depay '
             '! h264parse name=source_parser config-interval=1 '
             '! video/x-h264,stream-format=byte-stream,alignment=au '
@@ -616,7 +616,7 @@ class MediaBridge:
         if result == Gst.StateChangeReturn.FAILURE:
             raise RuntimeError("GStreamer WebRTC pipeline 启动失败")
         print(
-            f"[media] viewer {viewer_id} 已连接，RTP reorder={self.jitter_latency_ms}ms，retime=h264-au-arrival-clock，AU drop=off",
+            f"[media] viewer {viewer_id} 已连接，RTP reorder={self.jitter_latency_ms}ms，drop-on-latency=off，retime=h264-au-arrival-clock，AU drop=off",
             flush=True,
         )
 
@@ -692,7 +692,7 @@ class MediaBridge:
 
     async def run(self) -> None:
         print(
-            f"[media] CastBridge Media Bridge 启动，video RTP={self.video_port}，reorder={self.jitter_latency_ms}ms，retime=h264-au-arrival-clock，AU drop=off",
+            f"[media] CastBridge Media Bridge 启动，video RTP={self.video_port}，reorder={self.jitter_latency_ms}ms，drop-on-latency=off，retime=h264-au-arrival-clock，AU drop=off",
             flush=True,
         )
         status_task = asyncio.create_task(self.status_loop())
