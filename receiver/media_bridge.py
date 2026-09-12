@@ -44,9 +44,26 @@ class MediaBridge:
         self.last_video_at: float | None = None
         self.buffers = 0
         self.bytes = 0
+        self.input_fps = 0.0
+        self.input_mbps = 0.0
+        self.rate_sample_at = time.monotonic()
+        self.rate_sample_buffers = 0
+        self.rate_sample_bytes = 0
         self.last_error: str | None = None
         self.signaling_connected = False
         self.running = True
+
+    def update_input_rate(self, now: float) -> None:
+        elapsed = now - self.rate_sample_at
+        if elapsed <= 0:
+            return
+        buffer_delta = max(0, self.buffers - self.rate_sample_buffers)
+        byte_delta = max(0, self.bytes - self.rate_sample_bytes)
+        self.input_fps = buffer_delta / elapsed
+        self.input_mbps = (byte_delta * 8) / elapsed / 1_000_000
+        self.rate_sample_at = now
+        self.rate_sample_buffers = self.buffers
+        self.rate_sample_bytes = self.bytes
 
     def write_status(self) -> None:
         now_mono = time.monotonic()
@@ -79,6 +96,8 @@ class MediaBridge:
             "timestamp_epoch": int(time.time()),
             "video_rtp_port": self.video_port,
             "jitter_latency_ms": self.jitter_latency_ms,
+            "input_fps": round(self.input_fps, 1),
+            "input_mbps": round(self.input_mbps, 3),
             "signaling_connected": self.signaling_connected,
             "active_viewer": self.active_viewer,
             "peer_state": peer_state,
@@ -101,6 +120,7 @@ class MediaBridge:
             self.poll_bus()
             now = time.monotonic()
             if now - last_status_write >= 1.0:
+                self.update_input_rate(now)
                 self.write_status()
                 last_status_write = now
             await asyncio.sleep(0.02)
@@ -209,6 +229,11 @@ class MediaBridge:
         self.last_error = None
         self.buffers = 0
         self.bytes = 0
+        self.input_fps = 0.0
+        self.input_mbps = 0.0
+        self.rate_sample_at = time.monotonic()
+        self.rate_sample_buffers = 0
+        self.rate_sample_bytes = 0
 
     def start_peer(self, viewer_id: str) -> None:
         self.stop_peer()
