@@ -49,3 +49,10 @@ jobs:
           bash -n receiver/entrypoint.sh
       - name: Validate Docker Compose
         run: cp .env.example .env && docker compose config >/dev/null
+
+  receiver-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build UxPlay receiver image
+        run: docker build --build-arg UXPLAY_VERSION=1.74 -f receiver/Dockerfile .
