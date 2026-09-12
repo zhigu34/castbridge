@@ -40,19 +40,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libgstreamer1.0-dev \
         libplist-dev \
         libssl-dev \
-        patch \
         pkg-config
 
 WORKDIR /src/uxplay
 COPY ${UXPLAY_ARCHIVE} /tmp/uxplay.tar.gz
-COPY receiver/patches/uxplay-v1.73.7-rtp-do-timestamp.patch /tmp/uxplay-v1.73.7-rtp-do-timestamp.patch
 RUN set -eux; \
     tar -xzf /tmp/uxplay.tar.gz --strip-components=1; \
     rm -f /tmp/uxplay.tar.gz; \
-    test -f CMakeLists.txt; \
-    if [ "${UXPLAY_VERSION}" = "1.73.7" ]; then \
-      patch --batch --forward -p1 < /tmp/uxplay-v1.73.7-rtp-do-timestamp.patch; \
-    fi
+    test -f CMakeLists.txt
 
 RUN cmake -S . -B build \
       -DCMAKE_BUILD_TYPE=Release \
