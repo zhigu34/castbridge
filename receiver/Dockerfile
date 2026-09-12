@@ -114,8 +114,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 COPY --from=build /usr/local/bin/uxplay /usr/local/bin/uxplay
 COPY receiver/entrypoint.sh /usr/local/bin/castbridge-receiver
-# Media Bridge ships in the same runtime image as Receiver; keep this COPY
-# explicit so media-only changes can be validated independently in CI.
+# Media Bridge shares this runtime image with Receiver. Keeping the script as
+# an explicit build input ensures low-latency and diagnostics changes ship.
 COPY receiver/media_bridge.py /usr/local/lib/castbridge/media_bridge.py
 RUN chmod 0755 /usr/local/bin/castbridge-receiver /usr/local/lib/castbridge/media_bridge.py
 
