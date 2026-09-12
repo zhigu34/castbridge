@@ -1,29 +1,31 @@
-# CastBridge Development Guide
+# CastBridge 开发指南
 
-## Development philosophy
+## 开发原则
 
-CastBridge is a media/networking project first and a dashboard project second. Development should therefore validate protocol and media assumptions before adding abstractions or UI complexity.
+CastBridge 首先是一个媒体与网络项目，其次才是一个 Web 管理界面项目。
 
-The preferred workflow is:
+因此开发过程中应优先验证协议与媒体链路，而不是先堆叠 UI 和抽象层。
 
-1. Prove a media path with a minimal command-line pipeline.
-2. Measure it.
-3. Wrap it behind a stable interface.
-4. Add UI only after the behavior is reproducible.
+推荐工作方式：
 
-## Initial technology baseline
+1. 先用最小命令行管线验证媒体链路。
+2. 对链路做真实测量。
+3. 再封装为稳定接口。
+4. 行为可重复后再加入正式 UI。
+
+## 初始技术基线
 
 - Python 3.12+
 - FastAPI
 - Vue 3
 - TypeScript
 - Vite
-- GStreamer 1.x with WebRTC plugins
-- UxPlay as the initial AirPlay receiver
+- GStreamer 1.x，并安装 WebRTC 相关插件
+- UxPlay，作为第一阶段 AirPlay Receiver
 
-Exact dependency versions should be pinned when implementation starts and updated deliberately.
+正式开始开发后，应固定关键依赖版本，并通过明确升级流程更新。
 
-## Planned top-level structure
+## 规划目录结构
 
 ```text
 backend/
@@ -36,101 +38,105 @@ docs/
 
 ### `backend/`
 
-Owns API, configuration, signaling, session state, and process orchestration.
+负责 API、配置、WebRTC 信令、Session 状态和进程编排。
 
 ### `frontend/`
 
-Owns the browser display surface and diagnostics UI.
+负责浏览器显示页面和诊断 UI。
 
 ### `receiver/`
 
-Owns adapters and supervisors around native casting receivers. Protocol-specific behavior belongs here rather than leaking into the frontend.
+负责封装原生投屏 Receiver、协议 Adapter 和进程 Supervisor。
+
+协议特定行为应集中在这里，不向前端泄漏。
 
 ### `media/`
 
-Owns GStreamer pipelines, WebRTC integration, media capabilities, and statistics.
+负责 GStreamer Pipeline、WebRTC 集成、媒体能力和流统计。
 
 ### `deploy/`
 
-Owns systemd/Docker/reverse-proxy packaging after the core media path works.
+在核心媒体链路稳定后，负责 systemd、Docker、反向代理等部署内容。
 
-## API design rules
+## API 设计规范
 
-- Keep media bytes out of FastAPI.
-- Use typed request/response models.
-- Prefer explicit session state transitions over implicit booleans.
-- Use WebSocket events for live session changes.
-- Include stable machine-readable error codes alongside human-readable messages.
-- Add a `session_id` to logs/events as early as possible.
+- 原始媒体数据不经过 FastAPI。
+- Request / Response 使用明确的类型模型。
+- Session 使用显式状态机，不用多个隐式 boolean 拼状态。
+- 实时会话变化通过 WebSocket Event 推送。
+- 错误同时包含稳定的机器可读 error code 和人类可读 message。
+- 尽早在日志和事件里加入 `session_id`。
 
-## Subprocess rules
+## 子进程规范
 
-UxPlay and GStreamer command invocation is security-sensitive.
+UxPlay 和 GStreamer 的进程调用涉及安全边界。
 
-- Never build shell command strings from user input.
-- Use argument arrays with shell execution disabled.
-- Validate receiver names and media configuration.
-- Capture stdout/stderr.
-- Track exit code and restart count.
-- Rate-limit automatic restart loops.
-- Make shutdown graceful before sending a hard kill.
+- 禁止把用户输入直接拼成 shell command string。
+- 使用参数数组调用，默认禁用 shell 执行。
+- 校验 receiver name 和媒体配置。
+- 捕获 stdout / stderr。
+- 记录 exit code 和 restart count。
+- 自动重启必须限频，避免 crash loop。
+- 退出时先尝试 graceful shutdown，再考虑 hard kill。
 
-## Frontend rules
+## 前端规范
 
-- The viewer should have a small explicit state machine.
-- Playback state must not be inferred only from whether a `<video>` element has `srcObject`.
-- Browser autoplay failures must become visible UI states.
-- Fullscreen behavior should degrade gracefully when browser policies reject automatic fullscreen.
-- Diagnostics should be optional and not obstruct the viewing surface.
+- Viewer 使用明确的小型状态机。
+- 不允许仅通过 `<video>.srcObject` 是否存在来推断整个播放状态。
+- 浏览器 autoplay 被拦截时必须呈现明确 UI 状态。
+- 浏览器拒绝自动全屏时应正常降级，不影响基本观看。
+- 诊断面板应为可选功能，不遮挡核心画面。
 
-## Media rules
+## 媒体处理规范
 
-- Prefer passthrough/repacketization before transcoding.
-- Do not assume codec parameters; inspect real sender streams.
-- Record the exact negotiated WebRTC SDP during early development, but do not persist it in normal production logs.
-- Measure packet loss, jitter, RTT, bitrate, resolution, and frame rate.
-- When transcoding becomes necessary, document why and benchmark CPU/GPU cost.
+- 优先透传 / repacketization，再考虑 transcode。
+- 不假设编码参数，必须检查真实发送端输出。
+- 初期开发可以记录完整 WebRTC SDP 用于分析，但生产环境默认不长期保存。
+- 测量 packet loss、jitter、RTT、bitrate、resolution 和 frame rate。
+- 如必须转码，要记录为什么需要转码，并对 CPU / GPU 成本做基准测试。
 
-## Testing strategy
+## 测试策略
 
-### Unit tests
+### 单元测试
 
-Use unit tests for:
+适合覆盖：
 
-- configuration validation
-- session state transitions
-- signaling message validation
-- receiver-process parsing
-- command argument generation
+- 配置校验
+- Session 状态转换
+- Signaling Message 校验
+- Receiver 进程输出解析
+- 子进程命令参数生成
 
-### Integration tests
+### 集成测试
 
-Use integration tests for:
+适合覆盖：
 
-- API + WebSocket lifecycle
-- mocked receiver events
-- media-worker startup/cleanup
-- browser reconnect semantics
+- API + WebSocket 生命周期
+- Mock Receiver Event
+- Media Worker 启动 / 清理
+- 浏览器重连语义
 
-### Hardware/manual interoperability tests
+### 真机 / 手工兼容性测试
 
-Native casting requires real devices. Keep a compatibility matrix containing at least:
+原生投屏必须用真实设备验证。
 
-- sender device/model
+至少维护以下兼容性矩阵：
+
+- sender device / model
 - OS version
 - protocol
-- codec observed
-- resolution/fps
+- 实际 codec
+- resolution / fps
 - connection result
 - audio result
 - measured latency
 - notes
 
-Do not claim protocol/device compatibility based only on code paths or protocol documentation.
+不能仅因为代码路径存在或协议文档声称支持，就对外宣称某设备兼容。
 
-## Commit conventions
+## Commit 规范
 
-Use short conventional prefixes where practical:
+优先采用简洁 Conventional Commit 前缀：
 
 ```text
 feat: ...
@@ -141,40 +147,40 @@ refactor: ...
 chore: ...
 ```
 
-Prefer commits that represent one independently understandable change.
+一个 Commit 尽量只表达一个独立、可理解的改动。
 
-## Branching
+## 分支策略
 
-Until multiple contributors require a heavier model:
+在贡献者规模较小时保持简单：
 
-- `main` should remain runnable.
-- Use short-lived feature branches for non-trivial work.
-- Merge through PRs once CI exists.
+- `main` 始终尽量保持可运行。
+- 非简单改动使用短生命周期 feature branch。
+- CI 建立后通过 Pull Request 合并。
 
-## Documentation decisions
+## 架构决策记录
 
-Important architecture decisions discovered through prototypes should become ADRs under:
+原型阶段验证出的重要架构结论，应整理成 ADR 放在：
 
 ```text
 docs/adr/
 ```
 
-Examples:
+典型 ADR 包括：
 
-- WebRTC offerer role.
-- H.264 passthrough vs transcode strategy.
-- Process topology.
-- Deployment/networking model.
-- SFU selection, if one is eventually required.
+- WebRTC Offerer 由谁承担。
+- H.264 透传还是转码。
+- 进程拓扑。
+- 部署 / 网络模型。
+- 如果最终需要 SFU，选择哪一个方案。
 
-## Definition of done for technical milestones
+## 技术里程碑的完成定义
 
-A milestone is not complete because code compiles. It should have:
+一个里程碑不能因为“代码能编译”就算完成，至少还应具备：
 
-- a reproducible test path
-- clear logs on failure
-- cleanup on disconnect/shutdown
-- measured behavior where performance matters
-- relevant documentation updated
+- 可重复的测试路径
+- 出错时有清晰日志
+- 断开 / 退出时能正确清理资源
+- 性能敏感项有实际测量数据
+- 对应文档已经同步更新
 
-See [ROADMAP.md](ROADMAP.md) for milestone acceptance criteria.
+各阶段详细验收条件见 [ROADMAP.md](ROADMAP.md)。
