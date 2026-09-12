@@ -94,11 +94,19 @@ wait_for_health() {
   return 1
 }
 
-show_log_tail() {
-  local file="$1"
+show_error_summary() {
+  local file="$1" title="${2:-执行错误}" errors
   [ -f "$file" ] || return 0
-  warn "最后 80 行日志："
-  tail -n 80 "$file" >&2 || true
+
+  errors="$(grep -Ein '(^|[^[:alpha:]])(error|fatal|failed|failure|timeout|timed out|exit code|non-zero|unable to|could not|connection refused|network is unreachable|permission denied|not found)([^[:alpha:]]|$)' "$file" 2>/dev/null | tail -n 80 || true)"
+
+  warn "$title："
+  if [ -n "$errors" ]; then
+    printf '%s\n' "$errors" >&2
+  else
+    warn "未匹配到明确错误行，显示日志最后 60 行："
+    tail -n 60 "$file" >&2 2>/dev/null || true
+  fi
 }
 
 mkdir -p logs
@@ -109,7 +117,7 @@ printf '项目目录: %s\n' "$ROOT_DIR"
 command_exists docker || fail "未安装 Docker"
 docker version >/dev/null 2>&1 || fail "Docker daemon 不可用"
 docker compose version >/dev/null 2>&1 || fail "需要 Docker Compose v2"
-for cmd in awk grep tee; do command_exists "$cmd" || fail "缺少命令: $cmd"; done
+for cmd in awk grep; do command_exists "$cmd" || fail "缺少命令: $cmd"; done
 
 [ -f "$ENV_EXAMPLE" ] || fail "缺少 .env.example"
 if [ ! -f "$ENV_FILE" ]; then
@@ -140,12 +148,12 @@ if [ "$NO_BUILD" = "0" ]; then
   info "构建 CastBridge 镜像..."
   : > "$BUILD_LOG"
   set +e
-  docker compose build 2>&1 | tee "$BUILD_LOG"
-  rc=${PIPESTATUS[0]}
+  docker compose build >"$BUILD_LOG" 2>&1
+  rc=$?
   set -e
   if [ "$rc" -ne 0 ]; then
-    show_log_tail "$BUILD_LOG"
-    fail "镜像构建失败"
+    show_error_summary "$BUILD_LOG" "镜像构建错误摘要"
+    fail "镜像构建失败，完整日志: logs/deploy-build.log"
   fi
   ok "镜像构建完成"
 else
@@ -155,13 +163,14 @@ fi
 info "启动 CastBridge..."
 : > "$UP_LOG"
 set +e
-docker compose up -d 2>&1 | tee "$UP_LOG"
-rc=${PIPESTATUS[0]}
+docker compose up -d >"$UP_LOG" 2>&1
+rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
-  show_log_tail "$UP_LOG"
-  fail "容器启动失败"
+  show_error_summary "$UP_LOG" "容器启动错误摘要"
+  fail "容器启动失败，完整日志: logs/deploy-up.log"
 fi
+ok "容器启动完成"
 
 info "等待后端健康检查..."
 if ! wait_for_health castbridge-backend 120; then
