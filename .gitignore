@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Node / Vue
+node_modules/
+dist/
+.vite/
+coverage/
+*.tsbuildinfo
+
+# Environment / local config
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs / runtime
+*.log
+logs/
+run/
+*.pid
+
+# Media debugging artifacts
+captures/
+recordings/
+*.h264
+*.h265
+*.hevc
+*.rtp
+*.pcap
+*.pcapng
+*.sdp
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Build / native dependencies
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+
+# Certificates / secrets
+*.key
+*.pem
+*.p12
+*.pfx
+certs/private/
