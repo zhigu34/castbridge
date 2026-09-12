@@ -40,7 +40,7 @@ def load_media_status(status_file: Path, stale_seconds: int = 5) -> dict[str, An
 
     state = str(raw.get("state") or "unknown")
     fresh = age_seconds is not None and age_seconds <= stale_seconds
-    healthy = fresh and state not in {"error", "unavailable", "invalid"}
+    healthy = fresh and state in {"waiting", "negotiating", "streaming"}
     streaming = healthy and bool(raw.get("video_active"))
 
     if not fresh:
