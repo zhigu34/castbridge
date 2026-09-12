@@ -7,8 +7,8 @@ services:
       dockerfile: receiver/Dockerfile
       args:
         DEBIAN_BASE_IMAGE: ${DEBIAN_BASE_IMAGE:-debian:bookworm-slim}
-        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-http://mirrors.aliyun.com/debian}
-        DEBIAN_SECURITY_MIRROR: ${DEBIAN_SECURITY_MIRROR:-http://mirrors.aliyun.com/debian-security}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/debian}
+        DEBIAN_SECURITY_MIRROR: ${DEBIAN_SECURITY_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/debian-security}
         UXPLAY_VERSION: ${UXPLAY_VERSION:-1.73.7}
         UXPLAY_ARCHIVE: vendor/uxplay/uxplay-v${UXPLAY_VERSION:-1.73.7}.tar.gz
         HTTP_PROXY: ${HTTP_PROXY:-}
