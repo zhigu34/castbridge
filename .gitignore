@@ -29,6 +29,11 @@ logs/
 run/
 *.pid
 
+# Downloaded third-party source archives
+vendor/uxplay/*.tar.gz
+vendor/uxplay/*.part
+vendor/uxplay/*.invalid.*
+
 # Media debugging artifacts
 captures/
 recordings/
