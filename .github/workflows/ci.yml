@@ -58,15 +58,15 @@ jobs:
       - name: Cache UxPlay source archive
         uses: actions/cache@v4
         with:
-          path: vendor/uxplay/uxplay-v1.74.tar.gz
-          key: uxplay-source-v1.74
+          path: vendor/uxplay/uxplay-v1.73.7.tar.gz
+          key: uxplay-source-v1.73.7
       - name: Prepare UxPlay source archive
         env:
           GITHUB_PROXY_PROMPT: "0"
-        run: bash scripts/download-uxplay.sh 1.74
+        run: bash scripts/download-uxplay.sh 1.73.7
       - name: Build UxPlay receiver image
         run: >-
           docker build
-          --build-arg UXPLAY_VERSION=1.74
-          --build-arg UXPLAY_ARCHIVE=vendor/uxplay/uxplay-v1.74.tar.gz
+          --build-arg UXPLAY_VERSION=1.73.7
+          --build-arg UXPLAY_ARCHIVE=vendor/uxplay/uxplay-v1.73.7.tar.gz
           -f receiver/Dockerfile .
