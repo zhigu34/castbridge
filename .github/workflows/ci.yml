@@ -43,11 +43,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate shell scripts
+      - name: Validate shell and Python scripts
         run: |
           bash -n deploy.sh
           bash -n receiver/entrypoint.sh
           bash -n scripts/download-uxplay.sh
+          python3 -m py_compile receiver/media_bridge.py
       - name: Validate Docker Compose
         run: cp .env.example .env && docker compose config >/dev/null
 
@@ -64,7 +65,7 @@ jobs:
         env:
           GITHUB_PROXY_PROMPT: "0"
         run: bash scripts/download-uxplay.sh 1.73.7
-      - name: Build UxPlay receiver image
+      - name: Build UxPlay receiver and media runtime image
         run: >-
           docker build
           --build-arg UXPLAY_VERSION=1.73.7
