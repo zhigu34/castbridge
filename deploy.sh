@@ -26,7 +26,7 @@ CastBridge 一键部署脚本
   ./deploy.sh [选项]
 
 选项:
-  --check-only   只做环境/配置检查，不构建和启动
+  --check-only   只做环境和配置检查，不构建、不启动
   --no-build     跳过镜像构建，直接启动现有镜像
   -h, --help     显示帮助
 
@@ -70,6 +70,12 @@ ensure_env_key() {
   grep -q "^${key}=" "$ENV_FILE" || env_set "$key" "$value"
 }
 
+validate_port() {
+  local key="$1" value="$2" min="${3:-1}" max="${4:-65535}"
+  case "$value" in ''|*[!0-9]*) fail "$key 不是有效端口: $value" ;; esac
+  [ "$value" -ge "$min" ] && [ "$value" -le "$max" ] || fail "$key 超出端口范围 ${min}-${max}: $value"
+}
+
 normalize_arch() {
   case "$1" in
     x86_64|amd64) echo amd64 ;;
@@ -90,7 +96,7 @@ show_error_summary() {
   local file="$1" title="${2:-执行错误}" errors
   [ -f "$file" ] || return 0
 
-  errors="$(grep -Ein '(^|[^[:alpha:]])(error|fatal|failed|failure|timeout|timed out|exit code|non-zero|unable to|could not|connection refused|network is unreachable|permission denied|not found|no space left|denied)([^[:alpha:]]|$)' "$file" 2>/dev/null | tail -n 80 || true)"
+  errors="$(grep -Ein '(^|[^[:alpha:]])(error|fatal|failed|failure|timeout|timed out|exit code|non-zero|unable to|could not|connection refused|network is unreachable|permission denied|not found|no space left|denied|address already in use)([^[:alpha:]]|$)' "$file" 2>/dev/null | tail -n 80 || true)"
 
   warn "$title："
   if [ -n "$errors" ]; then
@@ -138,31 +144,47 @@ port_in_use() {
   return 2
 }
 
-project_owns_port() {
+project_owns_web_port() {
   local port="$1"
-  if docker inspect castbridge-web >/dev/null 2>&1 && docker port castbridge-web 2>/dev/null | grep -Eq ":${port}$"; then
-    return 0
-  fi
-  return 1
+  docker inspect castbridge-web >/dev/null 2>&1 \
+    && docker port castbridge-web 2>/dev/null | grep -Eq ":${port}$"
 }
 
-check_port() {
+receiver_is_running() {
+  [ "$(docker inspect -f '{{.State.Running}}' castbridge-receiver 2>/dev/null || true)" = "true" ]
+}
+
+check_web_port() {
   local port="$1" rc
-  if project_owns_port "$port"; then
+  if project_owns_web_port "$port"; then
     ok "Web 端口 $port 已由 CastBridge 使用"
     return 0
   fi
 
-  set +e
-  port_in_use "$port"
-  rc=$?
-  set -e
-
+  set +e; port_in_use "$port"; rc=$?; set -e
   case "$rc" in
     0) fail "Web 端口 $port 已被其他进程占用，请修改 .env 中 CASTBRIDGE_WEB_PORT" ;;
     1) ok "Web 端口可用: $port" ;;
-    2) warn "没有 ss/lsof/netstat，跳过端口 $port 检测" ;;
+    2) warn "没有 ss/lsof/netstat，跳过 Web 端口 $port 检测" ;;
   esac
+}
+
+check_airplay_ports() {
+  local base="$1" port rc
+  if receiver_is_running; then
+    ok "AirPlay Receiver 已在运行，端口占用将在容器更新时重新校验"
+    return 0
+  fi
+
+  for port in "$base" "$((base + 1))" "$((base + 2))"; do
+    set +e; port_in_use "$port"; rc=$?; set -e
+    case "$rc" in
+      0) fail "AirPlay TCP 端口 $port 已被其他进程占用，请修改 CASTBRIDGE_AIRPLAY_PORT" ;;
+      1) ;;
+      2) warn "没有 ss/lsof/netstat，跳过 AirPlay TCP 端口检测"; return 0 ;;
+    esac
+  done
+  ok "AirPlay TCP 端口可用: ${base}-$((base + 2))"
 }
 
 wait_for_health() {
@@ -227,7 +249,10 @@ compose_up_with_network_recovery() {
   return "$rc"
 }
 
-mkdir -p logs
+mkdir -p logs run
+for dir in logs run; do
+  [ -w "$dir" ] || fail "目录不可写: $dir"
+done
 : > "$PREFLIGHT_LOG"
 
 info "CastBridge 部署前检查开始"
@@ -261,11 +286,32 @@ ensure_env_key TZ Asia/Shanghai
 ensure_env_key CASTBRIDGE_ENVIRONMENT production
 ensure_env_key CASTBRIDGE_RECEIVER_NAME CastBridge
 ensure_env_key CASTBRIDGE_LOG_LEVEL INFO
+ensure_env_key CASTBRIDGE_RECEIVER_STALE_SECONDS 10
+ensure_env_key UXPLAY_VERSION 1.74
+ensure_env_key CASTBRIDGE_AIRPLAY_PORT 7100
+ensure_env_key CASTBRIDGE_RTP_VIDEO_PORT 5000
+ensure_env_key CASTBRIDGE_RTP_AUDIO_PORT 5002
 
 WEB_PORT="$(env_get CASTBRIDGE_WEB_PORT)"
-case "$WEB_PORT" in ''|*[!0-9]*) fail "CASTBRIDGE_WEB_PORT 不是有效端口: $WEB_PORT" ;; esac
-[ "$WEB_PORT" -ge 1 ] && [ "$WEB_PORT" -le 65535 ] || fail "CASTBRIDGE_WEB_PORT 超出有效范围: $WEB_PORT"
-check_port "$WEB_PORT"
+AIRPLAY_PORT="$(env_get CASTBRIDGE_AIRPLAY_PORT)"
+VIDEO_RTP_PORT="$(env_get CASTBRIDGE_RTP_VIDEO_PORT)"
+AUDIO_RTP_PORT="$(env_get CASTBRIDGE_RTP_AUDIO_PORT)"
+RECEIVER_NAME="$(env_get CASTBRIDGE_RECEIVER_NAME)"
+
+validate_port CASTBRIDGE_WEB_PORT "$WEB_PORT"
+validate_port CASTBRIDGE_AIRPLAY_PORT "$AIRPLAY_PORT" 1024 65533
+validate_port CASTBRIDGE_RTP_VIDEO_PORT "$VIDEO_RTP_PORT" 1024 65535
+validate_port CASTBRIDGE_RTP_AUDIO_PORT "$AUDIO_RTP_PORT" 1024 65535
+[ "$VIDEO_RTP_PORT" != "$AUDIO_RTP_PORT" ] || fail "视频和音频 RTP 端口不能相同"
+for airplay_port in "$AIRPLAY_PORT" "$((AIRPLAY_PORT + 1))" "$((AIRPLAY_PORT + 2))"; do
+  [ "$WEB_PORT" != "$airplay_port" ] || fail "Web 端口不能与 AirPlay 端口重复: $WEB_PORT"
+  [ "$VIDEO_RTP_PORT" != "$airplay_port" ] || fail "视频 RTP 端口不能与 AirPlay 端口重复: $VIDEO_RTP_PORT"
+  [ "$AUDIO_RTP_PORT" != "$airplay_port" ] || fail "音频 RTP 端口不能与 AirPlay 端口重复: $AUDIO_RTP_PORT"
+done
+[ -n "$RECEIVER_NAME" ] || fail "CASTBRIDGE_RECEIVER_NAME 不能为空"
+
+check_web_port "$WEB_PORT"
+check_airplay_ports "$AIRPLAY_PORT"
 
 FREE_KB="$(df -Pk "$ROOT_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
 if [ -n "$FREE_KB" ] && [ "$FREE_KB" -lt 5242880 ]; then
@@ -277,6 +323,7 @@ fi
 ensure_image python:3.12-slim "$DOCKER_ARCH"
 ensure_image node:22-alpine "$DOCKER_ARCH"
 ensure_image nginx:1.27-alpine "$DOCKER_ARCH"
+ensure_image debian:bookworm-slim "$DOCKER_ARCH"
 
 COMPOSE=(docker compose --env-file "$ENV_FILE")
 "${COMPOSE[@]}" config >/dev/null || fail "docker compose 配置校验失败"
@@ -292,10 +339,10 @@ if [ "$NO_BUILD" = "0" ]; then
   if "${COMPOSE[@]}" build --help 2>/dev/null | grep -q -- '--builder'; then
     BUILD_CMD+=(--builder default)
   fi
-  BUILD_CMD+=(backend frontend)
+  BUILD_CMD+=(receiver backend frontend)
 
   : > "$BUILD_LOG"
-  info "开始构建 backend/frontend（默认静默，完整日志: logs/deploy-build.log）..."
+  info "开始构建 receiver/backend/frontend（默认静默，完整日志: logs/deploy-build.log）..."
 
   set +e
   if [ "${DEPLOY_BUILD_VERBOSE:-0}" = "1" ]; then
@@ -311,7 +358,7 @@ if [ "$NO_BUILD" = "0" ]; then
     show_error_summary "$BUILD_LOG" "镜像构建错误摘要"
     fail "镜像构建失败，完整日志: logs/deploy-build.log"
   fi
-  ok "backend/frontend 镜像构建完成"
+  ok "receiver/backend/frontend 镜像构建完成"
 else
   warn "已使用 --no-build，跳过镜像构建"
 fi
@@ -322,6 +369,13 @@ if ! compose_up_with_network_recovery; then
   fail "docker compose up 失败，完整日志: logs/deploy-up.log"
 fi
 ok "容器启动完成"
+
+info "等待 AirPlay Receiver 健康..."
+if ! wait_for_health castbridge-receiver 90; then
+  "${COMPOSE[@]}" logs --tail=160 receiver >&2 || true
+  fail "AirPlay Receiver 未通过健康检查"
+fi
+ok "AirPlay Receiver healthy（${RECEIVER_NAME}）"
 
 info "等待 backend 健康..."
 if ! wait_for_health castbridge-backend 150; then
@@ -348,8 +402,13 @@ case "$HTTP_RC" in
 esac
 
 printf '\n'
-ok "CastBridge 部署完成"
-printf 'Web:         http://127.0.0.1:%s\n' "$WEB_PORT"
-printf '局域网访问: http://<本机IP>:%s\n' "$WEB_PORT"
-printf 'Backend:     internal only (backend:8000，通过 Web /api 和 /ws 访问)\n'
+ok "CastBridge M1 部署完成"
+printf 'Web:             http://127.0.0.1:%s\n' "$WEB_PORT"
+printf '局域网访问:     http://<本机IP>:%s\n' "$WEB_PORT"
+printf 'AirPlay 名称:   %s\n' "$RECEIVER_NAME"
+printf 'AirPlay 端口:   TCP/UDP %s-%s\n' "$AIRPLAY_PORT" "$((AIRPLAY_PORT + 2))"
+printf 'mDNS:           UDP 5353（宿主机防火墙需允许局域网访问）\n'
+printf 'RTP 预留输出:   video=%s / audio=%s\n' "$VIDEO_RTP_PORT" "$AUDIO_RTP_PORT"
+printf '\n现在可在 iPhone/iPad/Mac 的“屏幕镜像”中查找 "%s"。\n' "$RECEIVER_NAME"
+printf '如无法发现，先检查宿主机防火墙 UDP 5353，以及客户端和服务器是否处于同一局域网。\n'
 printf '\n推荐更新命令:\n  git pull && ./deploy.sh && docker image prune -f\n'
