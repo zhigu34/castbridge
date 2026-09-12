@@ -21,6 +21,9 @@ Gst.init(None)
 class MediaBridge:
     def __init__(self) -> None:
         self.video_port = int(os.getenv("CASTBRIDGE_RTP_VIDEO_PORT", "5000"))
+        self.jitter_latency_ms = int(os.getenv("CASTBRIDGE_RTP_JITTER_MS", "10"))
+        if self.jitter_latency_ms < 0 or self.jitter_latency_ms > 1000:
+            raise ValueError("CASTBRIDGE_RTP_JITTER_MS 必须在 0-1000 范围内")
         self.signaling_url = os.getenv(
             "CASTBRIDGE_WEBRTC_SIGNALING_URL",
             "ws://127.0.0.1:8090/ws/media",
@@ -75,6 +78,7 @@ class MediaBridge:
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "timestamp_epoch": int(time.time()),
             "video_rtp_port": self.video_port,
+            "jitter_latency_ms": self.jitter_latency_ms,
             "signaling_connected": self.signaling_connected,
             "active_viewer": self.active_viewer,
             "peer_state": peer_state,
@@ -211,15 +215,15 @@ class MediaBridge:
         self.active_viewer = viewer_id
         self.last_error = None
 
-        # Keep the AirPlay H.264 bitstream codec-transparent, but normalize NAL
-        # access units for browser WebRTC receivers. Repeat SPS/PPS once per
-        # second so a viewer joining an already-running AirPlay session can
-        # acquire decoder configuration promptly. Avoid STAP-A aggregation for
-        # maximum browser/hardware-decoder compatibility.
+        # UxPlay and Media Bridge run on the same host, so only a very small RTP
+        # reorder window is needed. Keep the jitterbuffer for packet ordering,
+        # but default it to 10 ms to avoid unnecessary playout latency.
+        # H.264 remains codec-transparent: repeat SPS/PPS periodically and avoid
+        # STAP-A aggregation for broad browser/hardware-decoder compatibility.
         description = (
             f'udpsrc port={self.video_port} '
             'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
-            '! rtpjitterbuffer latency=50 drop-on-latency=true '
+            f'! rtpjitterbuffer latency={self.jitter_latency_ms} drop-on-latency=true '
             '! rtph264depay '
             '! h264parse name=parser config-interval=1 '
             '! video/x-h264,stream-format=byte-stream,alignment=au '
@@ -248,7 +252,7 @@ class MediaBridge:
         if result == Gst.StateChangeReturn.FAILURE:
             raise RuntimeError("GStreamer WebRTC pipeline 启动失败")
         print(
-            f"[media] viewer {viewer_id} 已连接，监听 H.264 RTP 127.0.0.1:{self.video_port}",
+            f"[media] viewer {viewer_id} 已连接，监听 H.264 RTP 127.0.0.1:{self.video_port}，jitter={self.jitter_latency_ms}ms",
             flush=True,
         )
 
@@ -324,7 +328,7 @@ class MediaBridge:
 
     async def run(self) -> None:
         print(
-            f"[media] CastBridge Media Bridge 启动，video RTP={self.video_port}",
+            f"[media] CastBridge Media Bridge 启动，video RTP={self.video_port}，jitter={self.jitter_latency_ms}ms",
             flush=True,
         )
         status_task = asyncio.create_task(self.status_loop())
