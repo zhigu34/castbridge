@@ -14,6 +14,14 @@ def load_media_status(status_file: Path, stale_seconds: int = 5) -> dict[str, An
         "age_seconds": None,
         "video_rtp_port": None,
         "jitter_latency_ms": None,
+        "retime_mode": None,
+        "retimed_au_buffers": 0,
+        "retime_push_failures": 0,
+        "source_idr_count": 0,
+        "source_sps_count": 0,
+        "source_pps_count": 0,
+        "last_idr_age_seconds": None,
+        "force_key_unit_events": 0,
         "input_fps": 0.0,
         "input_mbps": 0.0,
         "input_rtp_clock_ratio": 0.0,
@@ -74,6 +82,18 @@ def load_media_status(status_file: Path, stale_seconds: int = 5) -> dict[str, An
         "age_seconds": round(age_seconds, 1) if age_seconds is not None else None,
         "video_rtp_port": raw.get("video_rtp_port"),
         "jitter_latency_ms": raw.get("jitter_latency_ms"),
+        "retime_mode": raw.get("retime_mode"),
+        "retimed_au_buffers": int(raw.get("retimed_au_buffers") or 0),
+        "retime_push_failures": int(raw.get("retime_push_failures") or 0),
+        "source_idr_count": int(raw.get("source_idr_count") or 0),
+        "source_sps_count": int(raw.get("source_sps_count") or 0),
+        "source_pps_count": int(raw.get("source_pps_count") or 0),
+        "last_idr_age_seconds": (
+            float(raw["last_idr_age_seconds"])
+            if isinstance(raw.get("last_idr_age_seconds"), (int, float))
+            else None
+        ),
+        "force_key_unit_events": int(raw.get("force_key_unit_events") or 0),
         "input_fps": float(raw.get("input_fps") or 0.0),
         "input_mbps": float(raw.get("input_mbps") or 0.0),
         "input_rtp_clock_ratio": float(raw.get("input_rtp_clock_ratio") or 0.0),
