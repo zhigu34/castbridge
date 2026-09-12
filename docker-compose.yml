@@ -1,0 +1,41 @@
+name: castbridge
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: castbridge-backend
+    init: true
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      CASTBRIDGE_ENVIRONMENT: ${CASTBRIDGE_ENVIRONMENT:-production}
+      CASTBRIDGE_RECEIVER_NAME: ${CASTBRIDGE_RECEIVER_NAME:-CastBridge}
+      CASTBRIDGE_LOG_LEVEL: ${CASTBRIDGE_LOG_LEVEL:-INFO}
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: castbridge-web
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${CASTBRIDGE_WEB_PORT:-8090}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
