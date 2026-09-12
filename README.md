@@ -6,7 +6,7 @@ CastBridge 是一个自托管投屏网关，用于接收 AirPlay 等原生无线
 
 ## 项目状态
 
-**早期设计 / v0.1 规划阶段。** 第一阶段刻意只打通一条可靠的端到端链路：
+当前进入 **M0 工程基础阶段**。第一阶段只打通一条可靠的端到端链路：
 
 **iPhone / iPad / Mac → AirPlay → CastBridge → WebRTC → 浏览器**
 
@@ -34,18 +34,18 @@ Miracast、Google Cast、DLNA、多观看端分发以及公网部署均放到后
 - Windows 和 macOS 观看端无需安装任何客户端。
 - 控制面与媒体面分离。
 - 提供简洁的 Web UI，用于显示接收器状态、投屏会话、播放状态和诊断信息。
-- 支持在 Linux 主机上可重复部署。
+- 使用 Docker Compose 作为默认部署方式。
 - 为 Miracast、Google Cast、DLNA 和基于 SFU 的多观看端模式保留清晰扩展路径。
 
 ## v0.1 暂不实现
 
 - 从零实现 AirPlay 协议。
 - Miracast / Wi-Fi Direct。
-- Google Cast 接收兼容。
+- Google Cast Receiver 兼容。
 - 以公网穿透为主要使用场景。
-- 远程键盘/鼠标控制发送端。
+- 远程键盘鼠标控制发送端。
 - 绕过 DRM 保护内容。
-- 将 4K/60 FPS 作为首发要求。
+- 以 4K/60 FPS 作为首发目标。
 
 ## v0.1 架构
 
@@ -59,103 +59,170 @@ Miracast、Google Cast、DLNA、多观看端分发以及公网部署均放到后
         └───────────────►│  └──────────┘              ▼│
                          │                      ┌──────────────┐
                          │                      │ GStreamer    │
-                         │                      │ 媒体桥接      │
+                         │                      │ Media Bridge │
                          │                      └──────┬───────┘
                          │                             │ WebRTC
                          │  ┌──────────────┐           │
                          │  │ FastAPI      │◄──────────┘
-                         │  │ 信令 / 会话   │
+                         │  │ Signaling /  │
+                         │  │ Session      │
                          │  └──────┬───────┘
                          └─────────┼─────────────────────┘
                                    │
                                    ▼
                          ┌──────────────────────┐
                          │ Vue 3 + TypeScript   │
-                         │ 浏览器显示端          │
+                         │ Browser Display      │
                          └──────────────────────┘
 ```
 
-### 技术栈
+## 技术栈
 
-| 层级 | 技术 | 职责 |
+| 层 | 技术 | 职责 |
 | --- | --- | --- |
-| 原生接收层 | UxPlay | AirPlay 发现、会话处理、解密后的媒体输出 |
-| 媒体管线 | GStreamer | RTP 接入、编解码处理、WebRTC 传输 |
-| WebRTC | GStreamer `webrtcbin` | SDP / ICE / 浏览器媒体传输 |
-| API / 信令 | FastAPI | 会话、WebSocket 信令、状态、健康检查 |
-| Web UI | Vue 3 + TypeScript | 观看页、全屏显示、会话状态、诊断信息 |
-| 部署 | Docker / systemd | 可重复的局域网部署 |
+| 原生投屏接收 | UxPlay | AirPlay 发现、会话处理、解密后媒体导出 |
+| 媒体管线 | GStreamer | RTP 接入、编码处理、WebRTC 传输 |
+| WebRTC | GStreamer `webrtcbin` | SDP / ICE / 媒体传输 |
+| API / 信令 | FastAPI | Session、WebSocket 信令、状态、健康检查 |
+| Web UI | Vue 3 + TypeScript | 浏览器观看、全屏、状态与诊断 |
+| Web 入口 | Nginx | 静态文件、API 与 WebSocket 反向代理 |
+| 部署 | Docker Compose + `deploy.sh` | 本地测试与局域网部署 |
 
-UxPlay 1.73+ 提供 `-vrtp` 和 `-artp`，可以将接收到的媒体转发给外部管线，而不是只能在本机直接渲染。v0.1 优先利用这一能力，不修改 AirPlay 接收器本身。
-
-## 目标目录结构
+## 当前目录结构
 
 ```text
 castbridge/
-├── backend/                 # FastAPI 后端
-├── frontend/                # Vue 3 + TypeScript Web UI
-├── media/                   # GStreamer / WebRTC 集成
-├── receiver/                # 投屏协议接收器集成
-├── deploy/                  # Docker、systemd、反向代理
+├── backend/                 # FastAPI 控制面
+│   ├── app/
+│   └── tests/
+├── frontend/                # Vue 3 + TypeScript
+│   └── src/
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── DEVELOPMENT.md
 │   └── ROADMAP.md
+├── docker-compose.yml
+├── deploy.sh
+├── .env.example
 └── README.md
 ```
 
-以上目录为目标结构，具体实现目录会随着各阶段开发逐步加入。
+`receiver/`、`media/` 等实现目录会在 M1/M2 开始时加入。
+
+## 快速部署
+
+默认部署方式与开发习惯为 Docker Compose。
+
+```bash
+git clone https://github.com/zhigu34/castbridge.git
+cd castbridge
+./deploy.sh
+```
+
+首次运行时，`deploy.sh` 会自动从 `.env.example` 创建 `.env`。
+
+默认访问：
+
+```text
+http://<服务器IP>:8090
+```
+
+端口可在 `.env` 中修改：
+
+```dotenv
+CASTBRIDGE_WEB_PORT=8090
+```
+
+### 日常更新
+
+推荐直接使用：
+
+```bash
+git pull && ./deploy.sh && docker image prune -f
+```
+
+`deploy.sh` 会执行：
+
+1. 检查 Docker、Docker Compose 和基础命令。
+2. 自动创建 `.env`。
+3. 检查 Web 端口占用。
+4. 校验 Compose 配置。
+5. 构建前后端镜像。
+6. 启动容器。
+7. 等待后端和 Web 入口健康检查通过。
+8. 失败时输出相关日志。
+
+也支持：
+
+```bash
+./deploy.sh --check-only
+./deploy.sh --no-build
+```
+
+常用命令：
+
+```bash
+make ps
+make logs
+make down
+make test
+```
+
+## M0 当前能力
+
+当前代码已具备：
+
+- FastAPI 应用骨架。
+- `/health`、`/api/health`、`/api/ready` 状态接口。
+- `/ws/system` WebSocket 基础通道。
+- Vue 3 + TypeScript 状态页面。
+- Nginx 统一 Web 入口和反向代理。
+- Docker Compose 前后端部署。
+- `deploy.sh` 一键部署与健康检查。
+- Python 后端基础测试。
+
+此阶段页面还不会显示真实 AirPlay 画面，下一阶段 M1 将开始接入 UxPlay。
 
 ## 目标使用流程
 
-1. 在局域网 Linux 主机上部署 CastBridge。
-2. 在 Windows 或 macOS 上打开 CastBridge 显示页面。
-3. 在 iPhone / iPad / Mac 中打开“屏幕镜像 / AirPlay”。
+1. 在局域网 Linux 主机部署 CastBridge。
+2. Windows 或 macOS 打开 CastBridge 网页。
+3. iPhone / iPad / Mac 打开 **屏幕镜像 / AirPlay**。
 4. 选择 CastBridge 接收器名称。
-5. 实时画面通过 WebRTC 自动出现在浏览器中。
-6. 发送端停止投屏后，浏览器自动回到待机页面。
+5. 画面通过 WebRTC 自动出现在浏览器。
+6. 发送端停止投屏后，网页自动回到等待页面。
 
 ## v0.1 性能目标
 
-- 支持 1080p 屏幕镜像。
-- 以 30 FPS 为基线，稳定后再评估 60 FPS。
-- 局域网端到端可见延迟目标：**低于 300 ms**，并持续向更低延迟优化。
-- 发送端断开、浏览器刷新后可自动恢复。
-- 浏览器协商允许时优先使用 H.264 透传 / 重新封装，避免不必要的解码再编码。
-
-## 安全模型
-
-v0.1 以局域网为主要使用场景，但仍保持基本安全边界：
-
-- 多用户部署前，为浏览器信令增加认证或短时 display/session token。
-- 接收器会话与观看端会话由 CastBridge 显式绑定。
-- 正式部署时 Web UI 使用 HTTPS。
-- 不尝试绕过 DRM 保护内容。
-- 在认证和 TURN 策略明确之前，不把公网访问列为支持场景。
+- 1080p 屏幕镜像。
+- 30 FPS 基线，稳定后再评估 60 FPS。
+- 局域网端到端延迟目标 `< 300 ms`，并继续优化。
+- 发送端断开、观看页刷新后可自动恢复。
+- 浏览器协商允许时优先 H.264 透传 / 重新封装，避免无必要的解码再编码。
 
 ## 文档
 
-- [系统架构](docs/ARCHITECTURE.md)
+- [技术架构](docs/ARCHITECTURE.md)
 - [开发指南](docs/DEVELOPMENT.md)
-- [开发路线图](docs/ROADMAP.md)
+- [开发路线与实施计划](docs/ROADMAP.md)
 
-## 开发里程碑
+## 开发阶段
 
-- **M0 — 项目基础：** 工程骨架、架构、开发环境。
-- **M1 — AirPlay 接入：** UxPlay 稳定启动并导出音视频 RTP。
-- **M2 — 浏览器视频：** RTP H.264 通过 WebRTC 到达浏览器。
-- **M3 — 音频与同步：** 浏览器获得同步的音视频。
-- **M4 — 产品界面：** Vue 观看页、会话状态、全屏、诊断。
-- **M5 — 打包部署：** Linux 部署、健康检查、日志、自动恢复。
-- **M6 — 多观看端：** 同一投屏会话支持多个浏览器同时观看。
-- **M7 — 协议扩展：** 分别评估 Miracast、Google Cast 和 DLNA。
+- **M0 — 工程基础：** Docker Compose、FastAPI、Vue、状态 API、部署脚本。
+- **M1 — AirPlay 接入：** UxPlay 稳定启动并导出视频/音频 RTP。
+- **M2 — 浏览器视频：** RTP H.264 通过 WebRTC 进入浏览器。
+- **M3 — 音频与音画同步：** 浏览器获得同步音视频。
+- **M4 — 产品化界面：** 正式 Viewer、会话状态、全屏和诊断。
+- **M5 — 稳定性与部署：** 进程监管、日志、升级和长期运行测试。
+- **M6 — 多观看端：** 同一个投屏会话支持多个浏览器。
+- **M7 — 协议扩展：** Miracast、Google Cast、DLNA 分别验证。
 
-详细验收标准与实施顺序见 [ROADMAP.md](docs/ROADMAP.md)。
+详见 [ROADMAP.md](docs/ROADMAP.md)。
 
 ## License
 
-项目暂未选择最终 License。UxPlay 使用 GPL-3.0，因此在确定 CastBridge 与 UxPlay 的打包、分发边界之前，需要先评估许可证影响，再决定 CastBridge 的最终授权方式。
+项目许可证暂未确定。UxPlay 使用 GPL-3.0，因此在决定最终许可证及发行方式前，需要先明确 UxPlay 的调用、打包和分发边界。
 
 ---
 
-**CastBridge — 原生投屏接入，WebRTC 浏览器输出。**
+**CastBridge — 原生投屏输入，WebRTC 浏览器输出。**
