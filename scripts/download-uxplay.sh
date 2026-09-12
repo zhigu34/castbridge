@@ -3,27 +3,18 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST_DIR="${ROOT_DIR}/vendor/uxplay"
-VERSION="${1:-${UXPLAY_VERSION:-1.74}}"
+VERSION="${1:-${UXPLAY_VERSION:-1.73.7}}"
 EXPECTED_SHA256="${UXPLAY_SHA256:-}"
 DOWNLOAD_PROXY="${GITHUB_DOWNLOAD_PROXY:-}"
 PROXY_PROMPT_DONE=0
 
-# UxPlay 1.74 当前是 master 上的 Experimental 版本，并没有 v1.74 tag。
-# 固定到 2026-09-06 的已验证 master commit，避免构建结果随 master 漂移。
-UXPLAY_174_COMMIT="f524d8aa28028ad5572ae1b462d119e4cec1f9f4"
+if [ "$VERSION" = "1.74" ] && [ -z "${UXPLAY_SOURCE_URL:-}" ]; then
+  echo "UxPlay 1.74 当前是 Experimental master，并不存在官方 v1.74 Release tag。" >&2
+  echo "生产部署请使用 1.73.7；如确需实验版，请显式设置 UXPLAY_SOURCE_URL。" >&2
+  exit 2
+fi
 
-default_source_url() {
-  case "$VERSION" in
-    1.74)
-      printf 'https://github.com/FDH2/UxPlay/archive/%s.tar.gz\n' "$UXPLAY_174_COMMIT"
-      ;;
-    *)
-      printf 'https://github.com/FDH2/UxPlay/archive/refs/tags/v%s.tar.gz\n' "$VERSION"
-      ;;
-  esac
-}
-
-SOURCE_URL="${UXPLAY_SOURCE_URL:-$(default_source_url)}"
+SOURCE_URL="${UXPLAY_SOURCE_URL:-https://github.com/FDH2/UxPlay/archive/refs/tags/v${VERSION}.tar.gz}"
 
 usage() {
   cat <<'USAGE'
@@ -32,13 +23,17 @@ Usage:
 
 Examples:
   bash scripts/download-uxplay.sh
-  bash scripts/download-uxplay.sh 1.74
+  bash scripts/download-uxplay.sh 1.73.7
 
 Optional environment variables:
   UXPLAY_SOURCE_URL=https://...       override UxPlay source archive URL
   UXPLAY_SHA256=<sha256>              verify source archive checksum when set
   GITHUB_DOWNLOAD_PROXY=http://...    proxy used only for this GitHub download
   GITHUB_PROXY_PROMPT=0               disable interactive proxy prompt
+
+Notes:
+  UxPlay 1.74 is currently an Experimental master version without an official
+  v1.74 release tag. To use it, UXPLAY_SOURCE_URL must be provided explicitly.
 USAGE
 }
 
