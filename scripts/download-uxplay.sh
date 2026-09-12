@@ -4,10 +4,26 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST_DIR="${ROOT_DIR}/vendor/uxplay"
 VERSION="${1:-${UXPLAY_VERSION:-1.74}}"
-SOURCE_URL="${UXPLAY_SOURCE_URL:-https://github.com/FDH2/UxPlay/archive/refs/tags/v${VERSION}.tar.gz}"
 EXPECTED_SHA256="${UXPLAY_SHA256:-}"
 DOWNLOAD_PROXY="${GITHUB_DOWNLOAD_PROXY:-}"
 PROXY_PROMPT_DONE=0
+
+# UxPlay 1.74 当前是 master 上的 Experimental 版本，并没有 v1.74 tag。
+# 固定到 2026-09-06 的已验证 master commit，避免构建结果随 master 漂移。
+UXPLAY_174_COMMIT="f524d8aa28028ad5572ae1b462d119e4cec1f9f4"
+
+default_source_url() {
+  case "$VERSION" in
+    1.74)
+      printf 'https://github.com/FDH2/UxPlay/archive/%s.tar.gz\n' "$UXPLAY_174_COMMIT"
+      ;;
+    *)
+      printf 'https://github.com/FDH2/UxPlay/archive/refs/tags/v%s.tar.gz\n' "$VERSION"
+      ;;
+  esac
+}
+
+SOURCE_URL="${UXPLAY_SOURCE_URL:-$(default_source_url)}"
 
 usage() {
   cat <<'USAGE'
@@ -47,7 +63,9 @@ validate_archive() {
   local file="$1" actual expected_lower actual_lower
   [ -s "$file" ] || return 1
   tar -tzf "$file" >/dev/null 2>&1 || return 1
-  tar -tzf "$file" 2>/dev/null | grep -Eq '^[^/]+/CMakeLists\.txt$' || return 1
+  tar -tzf "$file" 2>/dev/null \
+    | awk '/^[^/]+\/CMakeLists\.txt$/ {found=1} END {exit !found}' \
+    || return 1
 
   if [ -n "$EXPECTED_SHA256" ]; then
     actual="$(sha256_of "$file")" || {
