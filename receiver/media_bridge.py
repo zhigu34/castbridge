@@ -24,14 +24,9 @@ NANOSECONDS = 1_000_000_000.0
 class MediaBridge:
     def __init__(self) -> None:
         self.video_port = int(os.getenv("CASTBRIDGE_RTP_VIDEO_PORT", "5000"))
-        requested_jitter_ms = int(os.getenv("CASTBRIDGE_RTP_JITTER_MS", "0"))
-        if requested_jitter_ms < 0 or requested_jitter_ms > 1000:
+        self.jitter_latency_ms = int(os.getenv("CASTBRIDGE_RTP_JITTER_MS", "10"))
+        if self.jitter_latency_ms < 0 or self.jitter_latency_ms > 1000:
             raise ValueError("CASTBRIDGE_RTP_JITTER_MS 必须在 0-1000 范围内")
-        # The old localhost default was 10 ms. UxPlay's -vrtp stream can carry a
-        # non-advancing RTP timestamp; rtpjitterbuffer then propagates that bad
-        # clock into H.264 PTS. Treat the legacy 10 ms default as the new
-        # zero-buffer arrival-clock mode so existing .env files migrate safely.
-        self.jitter_latency_ms = 0 if requested_jitter_ms == 10 else requested_jitter_ms
         self.signaling_url = os.getenv(
             "CASTBRIDGE_WEBRTC_SIGNALING_URL",
             "ws://127.0.0.1:8090/ws/media",
@@ -45,6 +40,7 @@ class MediaBridge:
         self.websocket: Any = None
         self.pipeline: Gst.Pipeline | None = None
         self.webrtc: Gst.Element | None = None
+        self.au_src: Gst.Element | None = None
         self.active_viewer: str | None = None
         self.last_video_at: float | None = None
         self.buffers = 0
@@ -54,6 +50,8 @@ class MediaBridge:
         self.rate_sample_at = time.monotonic()
         self.rate_sample_buffers = 0
         self.rate_sample_bytes = 0
+        self.retimed_au_buffers = 0
+        self.retime_push_failures = 0
         self.last_error: str | None = None
         self.signaling_connected = False
         self.running = True
@@ -63,21 +61,17 @@ class MediaBridge:
         self.input_rtp_first_ts: int | None = None
         self.input_rtp_last_ts: int | None = None
         self.input_rtp_first_at: float | None = None
-        self.input_rtp_last_at: float | None = None
         self.input_rtp_clock_ratio = 0.0
         self.input_rtp_timestamp_changes = 0
 
         self.output_rtp_first_ts: int | None = None
         self.output_rtp_last_ts: int | None = None
         self.output_rtp_first_at: float | None = None
-        self.output_rtp_last_at: float | None = None
         self.output_rtp_clock_ratio = 0.0
         self.output_rtp_timestamp_changes = 0
 
         self.parser_first_pts: int | None = None
-        self.parser_last_pts: int | None = None
         self.parser_first_at: float | None = None
-        self.parser_last_at: float | None = None
         self.parser_pts_clock_ratio = 0.0
         self.parser_pts_valid_buffers = 0
 
@@ -94,7 +88,6 @@ class MediaBridge:
         first_ts_name = f"{direction}_rtp_first_ts"
         last_ts_name = f"{direction}_rtp_last_ts"
         first_at_name = f"{direction}_rtp_first_at"
-        last_at_name = f"{direction}_rtp_last_at"
         ratio_name = f"{direction}_rtp_clock_ratio"
         changes_name = f"{direction}_rtp_timestamp_changes"
 
@@ -103,7 +96,6 @@ class MediaBridge:
             setattr(self, first_ts_name, timestamp)
             setattr(self, last_ts_name, timestamp)
             setattr(self, first_at_name, now)
-            setattr(self, last_at_name, now)
             return
 
         last_ts = getattr(self, last_ts_name)
@@ -111,7 +103,6 @@ class MediaBridge:
             return
 
         setattr(self, last_ts_name, timestamp)
-        setattr(self, last_at_name, now)
         setattr(self, changes_name, getattr(self, changes_name) + 1)
         first_at = getattr(self, first_at_name)
         if first_at is None or now <= first_at:
@@ -128,12 +119,8 @@ class MediaBridge:
         self.parser_pts_valid_buffers += 1
         if self.parser_first_pts is None:
             self.parser_first_pts = pts
-            self.parser_last_pts = pts
             self.parser_first_at = now
-            self.parser_last_at = now
             return
-        self.parser_last_pts = pts
-        self.parser_last_at = now
         if self.parser_first_at is None or now <= self.parser_first_at:
             return
         pts_seconds = max(0.0, (pts - self.parser_first_pts) / NANOSECONDS)
@@ -183,6 +170,9 @@ class MediaBridge:
             "timestamp_epoch": int(time.time()),
             "video_rtp_port": self.video_port,
             "jitter_latency_ms": self.jitter_latency_ms,
+            "retime_mode": "h264-au-arrival-clock",
+            "retimed_au_buffers": self.retimed_au_buffers,
+            "retime_push_failures": self.retime_push_failures,
             "input_fps": round(self.input_fps, 1),
             "input_mbps": round(self.input_mbps, 3),
             "input_rtp_clock_ratio": round(self.input_rtp_clock_ratio, 4),
@@ -250,15 +240,42 @@ class MediaBridge:
                 self.update_rtp_clock("output", timestamp, time.monotonic())
         return Gst.PadProbeReturn.OK
 
-    def on_video_buffer(self, _pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+    def on_retimed_video_buffer(self, _pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
         buffer = info.get_buffer()
         if buffer is not None:
-            now = time.monotonic()
-            self.buffers += 1
-            self.bytes += buffer.get_size()
-            self.last_video_at = now
-            self.update_parser_pts(buffer.pts, now)
+            self.update_parser_pts(buffer.pts, time.monotonic())
         return Gst.PadProbeReturn.OK
+
+    def on_au_sample(self, sink: Gst.Element) -> Gst.FlowReturn:
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.EOS
+        buffer = sample.get_buffer()
+        au_src = self.au_src
+        if buffer is None or au_src is None:
+            return Gst.FlowReturn.OK
+
+        now = time.monotonic()
+        self.buffers += 1
+        self.bytes += buffer.get_size()
+        self.last_video_at = now
+
+        # The RTP timestamp from UxPlay -vrtp is not advancing. Keep the
+        # jitterbuffer to reconstruct complete ordered H.264 access units, then
+        # deliberately discard that broken timeline at the AU boundary. appsrc
+        # do-timestamp=true assigns one pipeline-running-time PTS to each full AU.
+        out_buffer = buffer.copy_deep()
+        out_buffer.pts = Gst.CLOCK_TIME_NONE
+        out_buffer.dts = Gst.CLOCK_TIME_NONE
+        out_buffer.duration = Gst.CLOCK_TIME_NONE
+        flow = au_src.emit("push-buffer", out_buffer)
+        if flow == Gst.FlowReturn.OK:
+            self.retimed_au_buffers += 1
+        else:
+            self.retime_push_failures += 1
+            if self.retime_push_failures <= 5:
+                print(f"[media] AU retime push failed: {flow}", flush=True)
+        return Gst.FlowReturn.OK
 
     def schedule_send(self, message: dict[str, Any]) -> None:
         if self.loop.is_closed():
@@ -335,6 +352,7 @@ class MediaBridge:
             self.pipeline.set_state(Gst.State.NULL)
         self.pipeline = None
         self.webrtc = None
+        self.au_src = None
         self.active_viewer = None
         self.last_video_at = None
         self.last_error = None
@@ -345,6 +363,8 @@ class MediaBridge:
         self.rate_sample_at = time.monotonic()
         self.rate_sample_buffers = 0
         self.rate_sample_bytes = 0
+        self.retimed_au_buffers = 0
+        self.retime_push_failures = 0
         self.reset_clock_metrics()
 
     def start_peer(self, viewer_id: str) -> None:
@@ -352,16 +372,16 @@ class MediaBridge:
         self.active_viewer = viewer_id
         self.last_error = None
 
-        jitter_stage = (
-            f'! rtpjitterbuffer latency={self.jitter_latency_ms} drop-on-latency=true '
-            if self.jitter_latency_ms > 0
-            else ''
-        )
         description = (
             f'udpsrc name=rtpin port={self.video_port} '
             'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
-            f'{jitter_stage}'
+            f'! rtpjitterbuffer latency={self.jitter_latency_ms} drop-on-latency=true '
             '! rtph264depay '
+            '! h264parse name=source_parser config-interval=1 '
+            '! video/x-h264,stream-format=byte-stream,alignment=au '
+            '! appsink name=au_sink emit-signals=true sync=false max-buffers=4 drop=true '
+            'appsrc name=au_src is-live=true format=time do-timestamp=true block=false '
+            'caps="video/x-h264,stream-format=byte-stream,alignment=au" '
             '! h264parse name=parser config-interval=1 '
             '! video/x-h264,stream-format=byte-stream,alignment=au '
             '! rtph264pay name=pay pt=96 mtu=1200 config-interval=1 aggregate-mode=none '
@@ -374,10 +394,19 @@ class MediaBridge:
 
         self.pipeline = pipeline
         self.webrtc = pipeline.get_by_name("webrtc")
+        self.au_src = pipeline.get_by_name("au_src")
         rtpin = pipeline.get_by_name("rtpin")
+        au_sink = pipeline.get_by_name("au_sink")
         parser = pipeline.get_by_name("parser")
         pay = pipeline.get_by_name("pay")
-        if self.webrtc is None or rtpin is None or parser is None or pay is None:
+        if (
+            self.webrtc is None
+            or self.au_src is None
+            or rtpin is None
+            or au_sink is None
+            or parser is None
+            or pay is None
+        ):
             raise RuntimeError("WebRTC pipeline 缺少必要元素")
 
         input_pad = rtpin.get_static_pad("src")
@@ -385,10 +414,11 @@ class MediaBridge:
             input_pad.add_probe(Gst.PadProbeType.BUFFER, self.on_input_rtp)
         parser_pad = parser.get_static_pad("src")
         if parser_pad is not None:
-            parser_pad.add_probe(Gst.PadProbeType.BUFFER, self.on_video_buffer)
+            parser_pad.add_probe(Gst.PadProbeType.BUFFER, self.on_retimed_video_buffer)
         output_pad = pay.get_static_pad("src")
         if output_pad is not None:
             output_pad.add_probe(Gst.PadProbeType.BUFFER, self.on_output_rtp)
+        au_sink.connect("new-sample", self.on_au_sample)
 
         self.webrtc.connect("on-negotiation-needed", self.on_negotiation_needed)
         self.webrtc.connect("on-ice-candidate", self.on_ice_candidate)
@@ -396,9 +426,8 @@ class MediaBridge:
         result = pipeline.set_state(Gst.State.PLAYING)
         if result == Gst.StateChangeReturn.FAILURE:
             raise RuntimeError("GStreamer WebRTC pipeline 启动失败")
-        jitter_label = f"{self.jitter_latency_ms}ms" if self.jitter_latency_ms > 0 else "off/arrival-clock"
         print(
-            f"[media] viewer {viewer_id} 已连接，监听 H.264 RTP 127.0.0.1:{self.video_port}，jitter={jitter_label}",
+            f"[media] viewer {viewer_id} 已连接，RTP reorder={self.jitter_latency_ms}ms，retime=h264-au-arrival-clock",
             flush=True,
         )
 
@@ -473,9 +502,8 @@ class MediaBridge:
                 await asyncio.sleep(2)
 
     async def run(self) -> None:
-        jitter_label = f"{self.jitter_latency_ms}ms" if self.jitter_latency_ms > 0 else "off/arrival-clock"
         print(
-            f"[media] CastBridge Media Bridge 启动，video RTP={self.video_port}，jitter={jitter_label}",
+            f"[media] CastBridge Media Bridge 启动，video RTP={self.video_port}，reorder={self.jitter_latency_ms}ms，retime=h264-au-arrival-clock",
             flush=True,
         )
         status_task = asyncio.create_task(self.status_loop())
