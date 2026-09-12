@@ -1,166 +1,167 @@
-# CastBridge Roadmap
+# CastBridge 开发路线图
 
-This roadmap intentionally validates the hardest technical assumptions before building a large UI or multi-protocol abstraction.
+这份路线图的核心原则是：**先验证最难、最不确定的技术链路，再做完整 UI 和多协议抽象。**
 
-## Guiding principle
+## 核心验收目标
 
-The first success criterion is not "the dashboard looks finished". It is:
+第一阶段的成功标准不是“后台看起来很完整”，而是：
 
-> **An iPhone can select CastBridge from Screen Mirroring and its live screen appears in a Windows/macOS browser with usable LAN latency.**
+> **iPhone 能在“屏幕镜像”中发现 CastBridge，并把实时画面低延迟显示到 Windows / macOS 浏览器中。**
 
-Everything else follows from proving that path.
-
----
-
-## M0 — Project foundation
-
-### Goal
-
-Create a reproducible development baseline and define component boundaries.
-
-### Tasks
-
-- [x] Create repository.
-- [x] Write project overview.
-- [x] Define initial architecture.
-- [x] Define staged implementation roadmap.
-- [ ] Create backend skeleton (`FastAPI`).
-- [ ] Create frontend skeleton (`Vue 3 + TypeScript + Vite`).
-- [ ] Add Python/Node linting and formatting.
-- [ ] Add development configuration model.
-- [ ] Add basic CI for backend and frontend checks.
-- [ ] Add `make`/task commands for common development operations.
-
-### Exit criteria
-
-- Backend starts and exposes `/api/health`.
-- Frontend starts and can query backend health.
-- CI runs on every push/PR.
-- Local setup is documented and repeatable.
+其他功能都建立在这条链路稳定之后。
 
 ---
 
-## M1 — AirPlay ingest proof
+## M0 — 项目基础
 
-### Goal
+### 目标
 
-Prove native sender discovery and extract incoming media without rendering it locally.
+建立可重复的开发环境，明确各组件边界。
 
-### Tasks
+### 任务
 
-- [ ] Document supported development OS and required packages.
-- [ ] Install/build a known UxPlay version.
-- [ ] Start UxPlay from Receiver Manager.
-- [ ] Advertise configurable receiver name (default `CastBridge`).
-- [ ] Confirm iPhone/iPad/macOS discovery.
-- [ ] Confirm sender connect/disconnect lifecycle.
-- [ ] Forward video through UxPlay `-vrtp`.
-- [ ] Forward audio through UxPlay `-artp`.
-- [ ] Record RTP metadata: codec, payload type, clock rate, resolution, fps.
-- [ ] Add structured logs for receiver events.
+- [x] 创建 GitHub 仓库。
+- [x] 编写项目说明。
+- [x] 定义初始系统架构。
+- [x] 编写阶段性开发路线图。
+- [x] 编写开发规范。
+- [ ] 创建 FastAPI 后端骨架。
+- [ ] 创建 Vue 3 + TypeScript + Vite 前端骨架。
+- [ ] 配置 Python / Node lint 和格式化。
+- [ ] 建立统一配置模型。
+- [ ] 加入后端 / 前端基础 CI。
+- [ ] 增加 Makefile 或 Taskfile，统一常用开发命令。
 
-### Prototype deliverable
+### 完成标准
 
-A CLI/debug pipeline that demonstrates:
+- 后端可以启动并提供 `/api/health`。
+- 前端可以启动并查询后端健康状态。
+- 每次 push / PR 自动执行 CI。
+- 本地环境搭建步骤有明确文档且可重复执行。
+
+---
+
+## M1 — AirPlay 接入验证
+
+### 目标
+
+验证原生设备发现，并从 AirPlay 会话中提取媒体流，而不是直接在本机窗口播放。
+
+### 任务
+
+- [ ] 明确开发环境支持的 Linux 发行版和依赖包。
+- [ ] 安装 / 编译固定版本 UxPlay。
+- [ ] 由 Receiver Manager 启动 UxPlay。
+- [ ] 支持配置广播名称，默认 `CastBridge`。
+- [ ] 验证 iPhone / iPad / macOS 可以发现 CastBridge。
+- [ ] 验证发送端连接 / 断开生命周期。
+- [ ] 通过 UxPlay `-vrtp` 导出视频。
+- [ ] 通过 UxPlay `-artp` 导出音频。
+- [ ] 记录 RTP 元数据：codec、payload type、clock rate、resolution、fps。
+- [ ] 为 Receiver 事件增加结构化日志。
+
+### 原型交付物
+
+先做一个 CLI / 调试管线：
 
 ```text
-iPhone -> AirPlay -> UxPlay -> RTP -> local test sink
+iPhone -> AirPlay -> UxPlay -> RTP -> 本地测试 Sink
 ```
 
-No browser is required yet.
+此阶段不要求浏览器参与。
 
-### Exit criteria
+### 完成标准
 
-- iPhone can find `CastBridge` in Screen Mirroring.
-- Mirroring can remain connected for at least 30 minutes without receiver crash.
-- Video RTP can be inspected/played by a local GStreamer pipeline.
-- Audio RTP can be inspected/played separately.
-- Sender disconnect is detected reliably.
+- iPhone 能在“屏幕镜像”中发现 `CastBridge`。
+- 连续镜像至少 30 分钟，Receiver 不崩溃。
+- 视频 RTP 可由本地 GStreamer 管线检查和播放。
+- 音频 RTP 可以独立检查和播放。
+- 发送端断开能被稳定识别。
 
 ---
 
-## M2 — Browser video over WebRTC
+## M2 — WebRTC 浏览器视频
 
-### Goal
+### 目标
 
-Deliver live mirrored video to one browser.
+让一个浏览器实时显示镜像视频。
 
-### Tasks
+### 任务
 
-- [ ] Build Media Worker around GStreamer.
-- [ ] Receive UxPlay video RTP.
-- [ ] Parse and normalize H.264.
-- [ ] Build initial `webrtcbin` pipeline.
-- [ ] Implement WebSocket signaling in FastAPI.
-- [ ] Implement browser `RTCPeerConnection` client.
-- [ ] Exchange SDP and ICE.
-- [ ] Attach remote stream to `<video>`.
-- [ ] Add session IDs and browser reconnect behavior.
-- [ ] Capture `getStats()` metrics.
+- [ ] 基于 GStreamer 实现 Media Worker。
+- [ ] 接收 UxPlay 视频 RTP。
+- [ ] 解析和规范化 H.264。
+- [ ] 搭建第一版 `webrtcbin` 管线。
+- [ ] 在 FastAPI 中实现 WebSocket 信令。
+- [ ] 实现浏览器端 `RTCPeerConnection`。
+- [ ] 完成 SDP / ICE 交换。
+- [ ] 将远程视频流绑定到 `<video>`。
+- [ ] 加入 Session ID 和浏览器重连逻辑。
+- [ ] 采集 `getStats()` 指标。
 
-### Primary experiment
+### 首要实验
 
-Attempt zero-transcode video first:
+优先验证零转码：
 
 ```text
 RTP/H.264 -> depay -> parse -> pay -> WebRTC
 ```
 
-If browser negotiation rejects the stream, document exactly why before adding transcoding.
+如果浏览器协商失败，必须先记录并明确失败原因，再决定是否增加转码路径。
 
-### Exit criteria
+### 完成标准
 
-- One browser displays the live iPhone/iPad/Mac mirrored screen.
-- Chrome/Edge on Windows works.
-- Chrome or Safari on macOS works.
-- Browser refresh can recover without manual server restart.
-- Baseline 1080p/30 is stable on a normal wired/Wi-Fi LAN.
-- End-to-end latency is measured and recorded.
+- 一个浏览器能实时显示 iPhone / iPad / Mac 镜像画面。
+- Windows Chrome / Edge 可用。
+- macOS Chrome 或 Safari 可用。
+- 浏览器刷新后无需手工重启服务器即可恢复。
+- 普通有线 / Wi-Fi 局域网下 1080p / 30 FPS 基线稳定。
+- 已测量并记录端到端延迟。
 
-### Decision gate
+### 决策节点
 
-After M2, write an ADR covering:
+M2 完成后新增 ADR，记录：
 
-- observed H.264 profile/level
-- whether passthrough works
-- whether transcode fallback is required
-- selected WebRTC offer/answer ownership model
-
----
-
-## M3 — Audio and A/V synchronization
-
-### Goal
-
-Add reliable browser audio and maintain sync.
-
-### Tasks
-
-- [ ] Receive UxPlay L16 RTP audio.
-- [ ] Normalize sample format/rate/channels.
-- [ ] Encode audio to Opus.
-- [ ] Add Opus track to WebRTC session.
-- [ ] Measure A/V drift over 30+ minute sessions.
-- [ ] Add jitter buffering/queue tuning as needed.
-- [ ] Handle browser autoplay restrictions gracefully.
-- [ ] Add mute/unmute UI.
-
-### Exit criteria
-
-- Browser receives both video and audio.
-- Long-running A/V drift is not visibly disruptive.
-- Disconnect/reconnect does not leave stuck audio pipelines.
-- Browser autoplay policy failures produce a clear user action instead of silent failure.
+- 实际观察到的 H.264 Profile / Level。
+- 是否能稳定透传。
+- 是否需要转码兜底。
+- WebRTC Offer / Answer 的最终发起方模型。
 
 ---
 
-## M4 — Product shell
+## M3 — 音频与音画同步
 
-### Goal
+### 目标
 
-Turn the prototype into a usable browser product.
+加入可靠的浏览器音频，并维持长期音画同步。
 
-### Viewer states
+### 任务
+
+- [ ] 接收 UxPlay L16 RTP 音频。
+- [ ] 统一采样格式 / 采样率 / 声道。
+- [ ] 编码成 Opus。
+- [ ] 将 Opus Track 加入 WebRTC 会话。
+- [ ] 测试 30 分钟以上会话的 A/V drift。
+- [ ] 根据实际情况调整 jitter buffer / queue。
+- [ ] 正确处理浏览器 autoplay 限制。
+- [ ] 增加静音 / 取消静音 UI。
+
+### 完成标准
+
+- 浏览器同时接收到视频和音频。
+- 长时间运行后没有明显音画漂移。
+- 断开 / 重连不会遗留卡死的音频管线。
+- 浏览器自动播放被拦截时，UI 明确提示用户操作。
+
+---
+
+## M4 — 产品化 Web 界面
+
+### 目标
+
+把技术原型整理成非技术用户也能使用的浏览器产品。
+
+### 页面状态
 
 - `BOOTING`
 - `READY`
@@ -169,208 +170,208 @@ Turn the prototype into a usable browser product.
 - `RECONNECTING`
 - `ERROR`
 
-### Tasks
+### 任务
 
-- [ ] Build full-screen display page.
-- [ ] Show receiver name and readiness.
-- [ ] Show sender/session information when available.
-- [ ] Automatically transition from idle to playback.
-- [ ] Automatically return to idle after sender disconnect.
-- [ ] Add fullscreen button.
-- [ ] Add stream stats panel.
-- [ ] Add receiver restart action.
-- [ ] Add human-readable error diagnostics.
-- [ ] Add responsive layout for desktop browsers.
+- [ ] 实现全屏显示页面。
+- [ ] 展示接收器名称和就绪状态。
+- [ ] 能获取时显示发送端 / Session 信息。
+- [ ] 从待机自动切换到播放。
+- [ ] 发送端断开后自动回到待机。
+- [ ] 增加全屏按钮。
+- [ ] 增加流媒体统计面板。
+- [ ] 增加 Receiver 重启动作。
+- [ ] 增加人类可读的错误诊断。
+- [ ] 完成桌面浏览器响应式布局。
 
-### Exit criteria
+### 完成标准
 
-A non-technical user can:
+非技术用户可以：
 
-1. Open the CastBridge page.
-2. See which receiver name to select.
-3. Start Screen Mirroring on an Apple device.
-4. See the stream automatically.
-5. Stop mirroring and see the page return to ready state.
-
----
-
-## M5 — Reliability and packaging
-
-### Goal
-
-Make CastBridge deployable as a LAN service rather than a developer demo.
-
-### Tasks
-
-- [ ] Define supported Linux distribution(s).
-- [ ] Add receiver/media process supervision.
-- [ ] Add startup readiness checks.
-- [ ] Add automatic restart with rate limiting.
-- [ ] Add `/api/health` and `/api/ready` detail.
-- [ ] Add log rotation/structured logging guidance.
-- [ ] Add configuration file/environment variables.
-- [ ] Test host-native systemd deployment.
-- [ ] Evaluate Docker/host-network deployment.
-- [ ] Add HTTPS reverse-proxy example.
-- [ ] Add upgrade/uninstall documentation.
-- [ ] Define third-party dependency/license packaging policy.
-
-### Reliability tests
-
-- [ ] 8-hour idle test.
-- [ ] 4-hour continuous cast test.
-- [ ] 50 connect/disconnect cycles.
-- [ ] 20 browser refresh/reconnect cycles during an active cast.
-- [ ] Sender disappears unexpectedly.
-- [ ] Receiver process is killed and recovers.
-- [ ] Media process is killed and recovers.
-
-### Exit criteria
-
-A clean Linux machine can follow the install documentation and become a functioning CastBridge receiver without editing source code.
+1. 打开 CastBridge 页面。
+2. 看到应该在手机中选择哪个接收器名称。
+3. 在 Apple 设备上启动屏幕镜像。
+4. 浏览器自动显示画面。
+5. 停止镜像后页面自动回到 READY。
 
 ---
 
-## M6 — Multi-viewer mode
+## M5 — 稳定性与部署
 
-### Goal
+### 目标
 
-Allow more than one browser to watch the same active cast.
+让 CastBridge 从开发 Demo 变成可以长期运行的局域网服务。
 
-### First step
+### 任务
 
-Benchmark direct peer-per-viewer fan-out.
+- [ ] 明确正式支持的 Linux 发行版。
+- [ ] 增加 Receiver / Media 进程监督。
+- [ ] 增加启动就绪检查。
+- [ ] 增加带频率限制的自动重启。
+- [ ] 完善 `/api/health` 和 `/api/ready`。
+- [ ] 增加日志轮转和结构化日志说明。
+- [ ] 支持配置文件 / 环境变量。
+- [ ] 验证宿主机 systemd 部署。
+- [ ] 评估 Docker + host network 部署。
+- [ ] 增加 HTTPS 反向代理示例。
+- [ ] 编写升级 / 卸载文档。
+- [ ] 明确第三方依赖和 License 打包策略。
 
-### Decision threshold
+### 稳定性测试
 
-If CPU/bandwidth scales poorly, introduce an SFU rather than duplicating expensive media work.
+- [ ] 空闲运行 8 小时。
+- [ ] 连续投屏 4 小时。
+- [ ] 50 次连接 / 断开循环。
+- [ ] 活跃投屏期间连续 20 次浏览器刷新 / 重连。
+- [ ] 发送端异常消失。
+- [ ] Receiver 进程被 kill 后自动恢复。
+- [ ] Media 进程被 kill 后自动恢复。
 
-Potential technologies to evaluate at that point:
+### 完成标准
+
+一台干净 Linux 主机按照安装文档操作后，无需修改源代码即可成为可用的 CastBridge 接收器。
+
+---
+
+## M6 — 多观看端模式
+
+### 目标
+
+允许多个浏览器同时观看同一次投屏。
+
+### 第一阶段
+
+先测量 Peer-per-viewer 的直接分发模式。
+
+### 决策原则
+
+如果 CPU 或带宽随观看端数量明显恶化，则引入 SFU，而不是复制高成本媒体处理链路。
+
+届时可评估：
 
 - LiveKit
 - mediasoup
-- Pion-based service
+- 基于 Pion 的自建服务
 
-Do not introduce an SFU before actual measurements justify it.
+在实际测试证明需要之前，不提前引入 SFU。
 
-### Exit criteria
+### 完成标准
 
-- At least 3 browser viewers can watch one cast on the target LAN hardware.
-- New viewers can join while a session is already active.
-- One viewer disconnecting does not affect others.
+- 目标局域网硬件上至少支持 3 个浏览器同时观看。
+- 新 Viewer 可以在投屏进行中加入。
+- 一个 Viewer 断开不会影响其他 Viewer。
 
 ---
 
-## M7 — Additional receiver protocols
+## M7 — 扩展其他投屏协议
 
-Each protocol is its own research/prototype milestone. Do not couple their schedules.
+每种协议单独研究和验证，不把进度绑在一起。
 
 ### Miracast
 
-Research areas:
+重点研究：
 
-- Miracast Sink implementation options.
-- Wi-Fi Direct hardware/driver requirements.
-- Infrastructure mode / MS-MICE feasibility.
-- Linux NetworkManager/wpa_supplicant conflicts.
-- RTP extraction into the existing Media Bridge.
+- Linux Miracast Sink 实现方案。
+- Wi-Fi Direct 对硬件 / 驱动的要求。
+- Infrastructure Mode / MS-MICE 可行性。
+- NetworkManager / wpa_supplicant 冲突。
+- 如何把 RTP 输出接入现有 Media Bridge。
 
-Desired result:
+目标链路：
 
 ```text
-Windows / supported Android
+Windows / 支持 Miracast 的 Android
         -> Miracast
         -> CastBridge
-        -> existing WebRTC viewer
+        -> 现有 WebRTC Viewer
 ```
 
 ### Google Cast
 
-Research areas:
+重点研究：
 
-- Device discovery.
-- Receiver authentication/certification constraints.
-- Difference between Cast Web Receiver applications and implementing a Cast-capable hardware/software receiver.
-- Whether a compliant self-hosted generic receiver is practical for the project.
+- 设备发现。
+- Receiver 身份认证 / 认证体系限制。
+- Cast Web Receiver App 与“实现一个 Cast 接收设备”之间的区别。
+- 自托管通用 Cast Receiver 是否现实且兼容。
 
-Do not advertise Google Cast compatibility until interoperability is demonstrated against real sender applications.
+在真实发送端 App 完成互操作验证之前，不对外宣称 Google Cast 兼容。
 
 ### DLNA
 
-DLNA is useful for media playback but is not equivalent to whole-screen mirroring. Treat it as a separate "play media to CastBridge" feature.
+DLNA 更适合媒体播放，不等同于整个屏幕镜像。
+
+将其作为单独的“将媒体播放到 CastBridge”功能，而不是 Mirroring 功能。
 
 ---
 
-# Suggested implementation order
-
-The development order should be:
+# 推荐开发顺序
 
 ```text
-1. Repository skeleton
-2. UxPlay lifecycle
-3. RTP video inspection
-4. WebRTC video
-5. Audio
-6. Session lifecycle
-7. Vue product UI
-8. Reliability
-9. Packaging
-10. Multi-viewer
-11. More protocols
+1. 工程骨架
+2. UxPlay 生命周期管理
+3. RTP 视频检查
+4. WebRTC 视频
+5. 音频
+6. Session 生命周期
+7. Vue 产品界面
+8. 稳定性
+9. 部署打包
+10. 多观看端
+11. 更多协议
 ```
 
-Avoid spending significant effort on branding, dashboards, permissions, or protocol abstractions before item 4 works.
+在第 4 步真正跑通之前，不投入大量精力做复杂后台、权限体系、品牌页面或过度协议抽象。
 
 ---
 
-# Initial issue breakdown
+# 第一批开发任务拆分
 
-When implementation begins, the first work items should be small enough to complete and test independently:
+开始编码后，第一批任务保持足够小，能独立开发和测试：
 
-1. **Bootstrap FastAPI backend**
+1. **初始化 FastAPI 后端**
    - health endpoint
    - settings model
    - structured logging
 
-2. **Bootstrap Vue frontend**
+2. **初始化 Vue 前端**
    - router
    - API client
-   - ready/health page
+   - ready / health 页面
 
-3. **Implement UxPlay supervisor**
-   - subprocess start/stop
-   - receiver name configuration
-   - log capture
-   - state events
+3. **实现 UxPlay Supervisor**
+   - subprocess start / stop
+   - receiver name 配置
+   - 日志采集
+   - 状态事件
 
-4. **Create RTP probe pipeline**
+4. **实现 RTP Probe Pipeline**
    - video UDP port
    - audio UDP port
-   - inspect caps and timestamps
+   - 检查 caps 和 timestamps
 
-5. **Create WebRTC proof-of-concept**
+5. **实现 WebRTC POC**
    - GStreamer `webrtcbin`
    - WebSocket signaling
-   - one browser video track
+   - 单浏览器 Video Track
 
-6. **Integrate receiver session with WebRTC viewer**
+6. **串联 Receiver Session 与 WebRTC Viewer**
    - active session event
-   - auto-start viewer
-   - cleanup on disconnect
+   - viewer 自动播放
+   - disconnect cleanup
 
 ---
 
-# Definition of v0.1
+# v0.1 完成定义
 
-v0.1 is complete when all of the following are true:
+满足以下全部条件后，CastBridge v0.1 才算完成：
 
-- CastBridge runs on the documented Linux host.
-- An iPhone/iPad/Mac discovers it through native AirPlay Screen Mirroring.
-- The sender can connect without a custom sender application.
-- A Windows or macOS browser can open the CastBridge web page and watch the screen.
-- Audio works.
-- The system survives routine connect/disconnect and browser-refresh cycles.
-- Logs and status information are sufficient to troubleshoot common failures.
-- Installation and operation are documented.
+- CastBridge 可以运行在文档指定的 Linux 主机上。
+- iPhone / iPad / Mac 能通过系统原生 AirPlay 屏幕镜像发现它。
+- 发送端无需安装专用 App 即可连接。
+- Windows 或 macOS 浏览器可以打开 CastBridge 网页观看实时屏幕。
+- 音频正常。
+- 系统可以承受正常的连接 / 断开以及浏览器刷新循环。
+- 日志和状态信息足以诊断常见故障。
+- 安装和日常使用方式有完整文档。
 
-Anything beyond this definition belongs to a later release.
+超出以上定义的内容统一进入后续版本。
