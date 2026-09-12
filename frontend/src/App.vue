@@ -12,6 +12,8 @@ type Ready = {
   receiver: string
   receiver_ready: boolean
   receiver_state: string
+  media_ready: boolean
+  media_state: string
   environment: string
 }
 
@@ -29,15 +31,57 @@ type Receiver = {
   message: string
 }
 
+type Media = {
+  healthy: boolean
+  streaming: boolean
+  state: string
+  engine: string
+  video_rtp_port: number | null
+  signaling_connected: boolean
+  broker_connected: boolean
+  active_viewer: string | null
+  viewer_count: number
+  peer_state: string
+  video_active: boolean
+  buffers: number
+  bytes: number
+  message: string
+  error: string | null
+}
+
+type SignalMessage = {
+  type: string
+  viewer_id?: string
+  media_connected?: boolean
+  sdp?: string
+  candidate?: string
+  sdp_mline_index?: number
+}
+
 const health = ref<Health | null>(null)
 const ready = ref<Ready | null>(null)
 const receiver = ref<Receiver | null>(null)
+const media = ref<Media | null>(null)
 const error = ref('')
 const socketState = ref<'连接中' | '已连接' | '未连接'>('连接中')
-let socket: WebSocket | null = null
-let statusTimer: number | null = null
+const viewerSocketState = ref<'连接中' | '已连接' | '未连接'>('连接中')
+const webrtcState = ref('等待 Media Bridge')
+const viewerId = ref('')
+const videoElement = ref<HTMLVideoElement | null>(null)
 
-const isReady = computed(() => health.value?.status === 'ok' && receiver.value?.healthy === true)
+let socket: WebSocket | null = null
+let viewerSocket: WebSocket | null = null
+let peer: RTCPeerConnection | null = null
+let statusTimer: number | null = null
+let viewerReconnectTimer: number | null = null
+let disposed = false
+let pendingCandidates: RTCIceCandidateInit[] = []
+
+const isReady = computed(() => (
+  health.value?.status === 'ok'
+  && receiver.value?.healthy === true
+  && media.value?.healthy === true
+))
 const receiverStateText = computed(() => {
   if (!receiver.value) return '检测中'
   if (receiver.value.healthy) return 'AirPlay 已就绪'
@@ -45,21 +89,30 @@ const receiverStateText = computed(() => {
   if (receiver.value.state === 'stopped') return 'Receiver 已停止'
   return receiver.value.message || receiver.value.state
 })
+const streamStateText = computed(() => {
+  if (webrtcState.value === 'connected') return 'WebRTC 已连接'
+  if (media.value?.streaming) return 'H.264 视频流已到达 Media Bridge'
+  if (media.value?.active_viewer) return '正在协商 WebRTC'
+  if (media.value?.healthy) return '等待浏览器视频会话'
+  return media.value?.message || 'Media Bridge 检测中'
+})
 
 async function loadStatus() {
   try {
     error.value = ''
-    const [healthResponse, readyResponse, receiverResponse] = await Promise.all([
+    const [healthResponse, readyResponse, receiverResponse, mediaResponse] = await Promise.all([
       fetch('/api/health'),
       fetch('/api/ready'),
       fetch('/api/v1/receiver'),
+      fetch('/api/v1/media'),
     ])
-    if (!healthResponse.ok || !readyResponse.ok || !receiverResponse.ok) {
+    if (!healthResponse.ok || !readyResponse.ok || !receiverResponse.ok || !mediaResponse.ok) {
       throw new Error('后端状态请求失败')
     }
     health.value = await healthResponse.json()
     ready.value = await readyResponse.json()
     receiver.value = await receiverResponse.json()
+    media.value = await mediaResponse.json()
   } catch (reason) {
     error.value = reason instanceof Error ? reason.message : '无法连接 CastBridge 后端'
   }
@@ -73,15 +126,151 @@ function connectSocket() {
   socket.onerror = () => { socketState.value = '未连接' }
 }
 
+function resetPeer() {
+  peer?.close()
+  peer = null
+  pendingCandidates = []
+  if (videoElement.value) videoElement.value.srcObject = null
+}
+
+function sendViewer(message: Record<string, unknown>) {
+  if (viewerSocket?.readyState === WebSocket.OPEN) {
+    viewerSocket.send(JSON.stringify(message))
+  }
+}
+
+async function handleOffer(sdp: string) {
+  resetPeer()
+  webrtcState.value = 'negotiating'
+
+  const connection = new RTCPeerConnection({ iceServers: [] })
+  peer = connection
+
+  connection.onicecandidate = (event) => {
+    if (!event.candidate) return
+    sendViewer({
+      type: 'webrtc.ice',
+      candidate: event.candidate.candidate,
+      sdp_mline_index: event.candidate.sdpMLineIndex ?? 0,
+    })
+  }
+
+  connection.ontrack = (event) => {
+    const stream = event.streams[0] ?? new MediaStream([event.track])
+    if (videoElement.value) {
+      videoElement.value.srcObject = stream
+      void videoElement.value.play().catch(() => undefined)
+    }
+  }
+
+  connection.onconnectionstatechange = () => {
+    webrtcState.value = connection.connectionState
+  }
+
+  await connection.setRemoteDescription({ type: 'offer', sdp })
+  for (const candidate of pendingCandidates) {
+    await connection.addIceCandidate(candidate)
+  }
+  pendingCandidates = []
+
+  const answer = await connection.createAnswer()
+  await connection.setLocalDescription(answer)
+  if (answer.sdp) {
+    sendViewer({ type: 'webrtc.answer', sdp: answer.sdp })
+  }
+}
+
+async function handleViewerMessage(event: MessageEvent<string>) {
+  let message: SignalMessage
+  try {
+    message = JSON.parse(event.data) as SignalMessage
+  } catch {
+    return
+  }
+
+  if (message.type === 'viewer.hello') {
+    viewerId.value = message.viewer_id ?? ''
+    if (!message.media_connected) webrtcState.value = '等待 Media Bridge'
+    return
+  }
+
+  if (message.type === 'media.offline') {
+    webrtcState.value = 'Media Bridge 离线'
+    resetPeer()
+    return
+  }
+
+  if (message.type === 'webrtc.offer' && message.sdp) {
+    try {
+      await handleOffer(message.sdp)
+    } catch (reason) {
+      webrtcState.value = 'failed'
+      error.value = reason instanceof Error ? `WebRTC 协商失败: ${reason.message}` : 'WebRTC 协商失败'
+    }
+    return
+  }
+
+  if (message.type === 'webrtc.ice' && message.candidate) {
+    const candidate: RTCIceCandidateInit = {
+      candidate: message.candidate,
+      sdpMLineIndex: message.sdp_mline_index ?? 0,
+    }
+    if (peer?.remoteDescription) {
+      try {
+        await peer.addIceCandidate(candidate)
+      } catch {
+        // ICE candidate may become obsolete during a reconnect.
+      }
+    } else {
+      pendingCandidates.push(candidate)
+    }
+  }
+}
+
+function scheduleViewerReconnect() {
+  if (disposed || viewerReconnectTimer !== null) return
+  viewerReconnectTimer = window.setTimeout(() => {
+    viewerReconnectTimer = null
+    connectViewerSocket()
+  }, 2000)
+}
+
+function connectViewerSocket() {
+  if (disposed) return
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  viewerSocketState.value = '连接中'
+  viewerSocket = new WebSocket(`${protocol}//${window.location.host}/ws/viewer`)
+
+  viewerSocket.onopen = () => {
+    viewerSocketState.value = '已连接'
+  }
+  viewerSocket.onmessage = (event) => {
+    void handleViewerMessage(event as MessageEvent<string>)
+  }
+  viewerSocket.onerror = () => {
+    viewerSocketState.value = '未连接'
+  }
+  viewerSocket.onclose = () => {
+    viewerSocketState.value = '未连接'
+    resetPeer()
+    scheduleViewerReconnect()
+  }
+}
+
 onMounted(() => {
   void loadStatus()
   statusTimer = window.setInterval(() => void loadStatus(), 3000)
   connectSocket()
+  connectViewerSocket()
 })
 
 onBeforeUnmount(() => {
+  disposed = true
   socket?.close()
+  viewerSocket?.close()
+  resetPeer()
   if (statusTimer !== null) window.clearInterval(statusTimer)
+  if (viewerReconnectTimer !== null) window.clearTimeout(viewerReconnectTimer)
 })
 </script>
 
@@ -97,15 +286,24 @@ onBeforeUnmount(() => {
       </div>
 
       <p class="lead">
-        当前进入 M1 AirPlay 接入验证。请在 iPhone / iPad / Mac 的“屏幕镜像”中查找下方接收器名称。
+        M2 视频链路已接入。iPhone / iPad / Mac 连接 CastBridge 后，H.264 RTP 将由 GStreamer 转为 WebRTC 并直接显示在浏览器中。
       </p>
 
       <div class="status-card" :class="{ ready: isReady }">
         <div>
           <span class="dot" />
-          <strong>{{ isReady ? 'AirPlay Receiver 已就绪' : receiverStateText }}</strong>
+          <strong>{{ isReady ? streamStateText : receiverStateText }}</strong>
         </div>
-        <span class="tag">{{ health?.version ?? 'v0.1.0' }}</span>
+        <span class="tag">{{ health?.version ?? 'v0.2.0' }}</span>
+      </div>
+
+      <div class="viewer-card" :class="{ active: webrtcState === 'connected' }">
+        <video ref="videoElement" autoplay playsinline muted />
+        <div v-if="webrtcState !== 'connected'" class="viewer-placeholder">
+          <strong>{{ streamStateText }}</strong>
+          <span>在 Apple 设备中打开“屏幕镜像”并选择 CastBridge</span>
+        </div>
+        <div class="viewer-badge">{{ webrtcState }}</div>
       </div>
 
       <div class="grid">
@@ -114,24 +312,24 @@ onBeforeUnmount(() => {
           <strong>{{ receiver?.receiver_name ?? ready?.receiver ?? 'CastBridge' }}</strong>
         </article>
         <article>
-          <span>Receiver</span>
+          <span>AirPlay Receiver</span>
           <strong>{{ receiver?.healthy ? '正常' : '未就绪' }}</strong>
         </article>
         <article>
-          <span>接收引擎</span>
-          <strong>{{ receiver?.engine ?? 'UxPlay' }} {{ receiver?.engine_version ?? '' }}</strong>
+          <span>Media Bridge</span>
+          <strong>{{ media?.healthy ? media.engine : '未就绪' }}</strong>
         </article>
         <article>
-          <span>AirPlay 端口</span>
-          <strong>{{ receiver?.airplay_port ? `${receiver.airplay_port}-${receiver.airplay_port + 2}` : '检测中' }}</strong>
+          <span>视频 RTP</span>
+          <strong>{{ media?.video_active ? `活跃 · ${media.buffers} buffers` : `${receiver?.video_rtp_port ?? 5000} · 等待` }}</strong>
         </article>
         <article>
-          <span>API / WebSocket</span>
-          <strong>{{ health?.status === 'ok' ? `正常 · ${socketState}` : '检测中' }}</strong>
+          <span>控制面</span>
+          <strong>{{ health?.status === 'ok' ? `API 正常 · ${socketState}` : '检测中' }}</strong>
         </article>
         <article>
-          <span>RTP 预留输出</span>
-          <strong>{{ receiver?.video_rtp_port ?? '-' }} / {{ receiver?.audio_rtp_port ?? '-' }}</strong>
+          <span>WebRTC 信令</span>
+          <strong>{{ viewerSocketState }} · {{ media?.peer_state ?? 'idle' }}</strong>
         </article>
       </div>
 
@@ -140,11 +338,11 @@ onBeforeUnmount(() => {
       <div class="flow">
         <span>iPhone / iPad / Mac</span>
         <b>AirPlay</b>
-        <span>UxPlay Receiver</span>
-        <b>RTP</b>
-        <span>Media Bridge（下一步）</span>
+        <span>UxPlay</span>
+        <b>H.264 RTP</b>
+        <span>GStreamer Media Bridge</span>
         <b>WebRTC</b>
-        <span>Browser</span>
+        <span>Browser Video</span>
       </div>
     </section>
   </main>
