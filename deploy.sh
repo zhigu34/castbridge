@@ -11,6 +11,7 @@ UP_LOG="$ROOT_DIR/logs/deploy-up.log"
 PREFLIGHT_LOG="$ROOT_DIR/logs/deploy-preflight.log"
 CHECK_ONLY=0
 NO_BUILD=0
+NO_UXPLAY_DOWNLOAD=0
 
 info() { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
@@ -19,29 +20,33 @@ fail() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 usage() {
-  cat <<'EOF'
+  cat <<'USAGE'
 CastBridge 一键部署脚本
 
 用法:
   ./deploy.sh [选项]
 
 选项:
-  --check-only   只做环境和配置检查，不构建、不启动
-  --no-build     跳过镜像构建，直接启动现有镜像
-  -h, --help     显示帮助
+  --check-only          只做环境和配置检查，不构建、不启动
+  --no-uxplay-download  UxPlay 本地源码包缺失时不联网下载
+  --no-build            跳过镜像构建，直接启动现有镜像
+  -h, --help            显示帮助
 
 可选环境变量:
-  DEPLOY_AUTO_PULL=0      缺少基础镜像时不自动 docker pull（默认 1）
-  DEPLOY_BUILD_VERBOSE=1  显示完整 Docker 构建输出（默认静默，仅失败时显示错误摘要）
+  DEPLOY_AUTO_PULL=0       缺少基础镜像时不自动 docker pull（默认 1）
+  DEPLOY_BUILD_VERBOSE=1   显示完整 Docker 构建输出（默认静默，仅失败时显示错误摘要）
+  GITHUB_DOWNLOAD_PROXY    仅 UxPlay GitHub 下载使用的代理
+  GITHUB_PROXY_PROMPT=0    禁止 UxPlay 下载时询问代理
 
 推荐更新方式:
   git pull && ./deploy.sh && docker image prune -f
-EOF
+USAGE
 }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --check-only) CHECK_ONLY=1 ;;
+    --no-uxplay-download) NO_UXPLAY_DOWNLOAD=1 ;;
     --no-build) NO_BUILD=1 ;;
     -h|--help) usage; exit 0 ;;
     *) fail "未知参数: $1（使用 --help 查看用法）" ;;
@@ -95,9 +100,7 @@ image_arch_ok() {
 show_error_summary() {
   local file="$1" title="${2:-执行错误}" errors
   [ -f "$file" ] || return 0
-
   errors="$(grep -Ein '(^|[^[:alpha:]])(error|fatal|failed|failure|timeout|timed out|exit code|non-zero|unable to|could not|connection refused|network is unreachable|permission denied|not found|no space left|denied|address already in use)([^[:alpha:]]|$)' "$file" 2>/dev/null | tail -n 80 || true)"
-
   warn "$title："
   if [ -n "$errors" ]; then
     printf '%s\n' "$errors" >&2
@@ -113,11 +116,9 @@ ensure_image() {
     ok "基础镜像可用: $image"
     return 0
   fi
-
   if [ "${DEPLOY_AUTO_PULL:-1}" = "0" ]; then
     fail "缺少可用基础镜像 $image，请先 docker pull/docker load，或取消 DEPLOY_AUTO_PULL=0"
   fi
-
   info "准备基础镜像: $image"
   : > "$PREFLIGHT_LOG"
   set +e
@@ -130,6 +131,56 @@ ensure_image() {
   fi
   image_arch_ok "$image" "$arch" || fail "基础镜像 $image 架构与 Docker Server 不匹配: $arch"
   ok "基础镜像准备完成: $image"
+}
+
+validate_uxplay_archive() {
+  local file="$1"
+  [ -s "$file" ] || return 1
+  tar -tzf "$file" >/dev/null 2>&1 || return 1
+  tar -tzf "$file" 2>/dev/null | grep -Eq '^[^/]+/CMakeLists\.txt$'
+}
+
+prepare_uxplay() {
+  local version="$1" expected source_url sha candidate
+  expected="$ROOT_DIR/vendor/uxplay/uxplay-v${version}.tar.gz"
+  mkdir -p "$ROOT_DIR/vendor/uxplay"
+
+  if validate_uxplay_archive "$expected"; then
+    ok "UxPlay 本地源码包有效: vendor/uxplay/uxplay-v${version}.tar.gz"
+    return 0
+  fi
+
+  if [ -e "$expected" ]; then
+    warn "UxPlay 本地源码包损坏，已隔离"
+    mv -f "$expected" "${expected}.invalid.$(date +%s)"
+  fi
+
+  for candidate in \
+    "$ROOT_DIR/UxPlay-${version}.tar.gz" \
+    "$ROOT_DIR/uxplay-v${version}.tar.gz" \
+    "$ROOT_DIR/vendor/uxplay/UxPlay-${version}.tar.gz"; do
+    if validate_uxplay_archive "$candidate"; then
+      mv "$candidate" "$expected"
+      ok "检测到已下载 UxPlay 源码包并自动归位"
+      return 0
+    fi
+  done
+
+  [ "$NO_UXPLAY_DOWNLOAD" = "0" ] || fail "缺少 UxPlay 本地源码包: vendor/uxplay/uxplay-v${version}.tar.gz"
+  [ -f "$ROOT_DIR/scripts/download-uxplay.sh" ] || fail "缺少 scripts/download-uxplay.sh"
+  command_exists curl || fail "需要 curl 下载 UxPlay，或手工放置 $expected"
+
+  source_url="$(env_get UXPLAY_SOURCE_URL || true)"
+  sha="$(env_get UXPLAY_SHA256 || true)"
+  info "UxPlay 本地源码包缺失，准备下载 v${version}..."
+  UXPLAY_SOURCE_URL="$source_url" \
+  UXPLAY_SHA256="$sha" \
+  GITHUB_DOWNLOAD_PROXY="${GITHUB_DOWNLOAD_PROXY:-}" \
+  GITHUB_PROXY_PROMPT="${GITHUB_PROXY_PROMPT:-1}" \
+    bash "$ROOT_DIR/scripts/download-uxplay.sh" "$version" || fail "UxPlay 下载失败"
+
+  validate_uxplay_archive "$expected" || fail "UxPlay 源码包校验失败: $expected"
+  ok "UxPlay 本地源码包准备完成"
 }
 
 port_in_use() {
@@ -146,8 +197,7 @@ port_in_use() {
 
 project_owns_web_port() {
   local port="$1"
-  docker inspect castbridge-web >/dev/null 2>&1 \
-    && docker port castbridge-web 2>/dev/null | grep -Eq ":${port}$"
+  docker inspect castbridge-web >/dev/null 2>&1 && docker port castbridge-web 2>/dev/null | grep -Eq ":${port}$"
 }
 
 receiver_is_running() {
@@ -160,7 +210,6 @@ check_web_port() {
     ok "Web 端口 $port 已由 CastBridge 使用"
     return 0
   fi
-
   set +e; port_in_use "$port"; rc=$?; set -e
   case "$rc" in
     0) fail "Web 端口 $port 已被其他进程占用，请修改 .env 中 CASTBRIDGE_WEB_PORT" ;;
@@ -175,7 +224,6 @@ check_airplay_ports() {
     ok "AirPlay Receiver 已在运行，端口占用将在容器更新时重新校验"
     return 0
   fi
-
   for port in "$base" "$((base + 1))" "$((base + 2))"; do
     set +e; port_in_use "$port"; rc=$?; set -e
     case "$rc" in
@@ -226,7 +274,6 @@ show_docker_networks() {
 compose_up_with_network_recovery() {
   local rc
   : > "$UP_LOG"
-
   set +e
   "${COMPOSE[@]}" up -d --remove-orphans >"$UP_LOG" 2>&1
   rc=$?
@@ -237,7 +284,6 @@ compose_up_with_network_recovery() {
     warn "检测到 Docker 默认地址池已耗尽，将清理未使用网络并重试一次。"
     show_docker_networks
     docker network prune -f >/dev/null || fail "docker network prune 执行失败"
-
     : > "$UP_LOG"
     set +e
     "${COMPOSE[@]}" up -d --remove-orphans >"$UP_LOG" 2>&1
@@ -245,12 +291,11 @@ compose_up_with_network_recovery() {
     set -e
     [ "$rc" -eq 0 ] && return 0
   fi
-
   return "$rc"
 }
 
-mkdir -p logs run
-for dir in logs run; do
+mkdir -p logs run vendor/uxplay
+for dir in logs run vendor/uxplay; do
   [ -w "$dir" ] || fail "目录不可写: $dir"
 done
 : > "$PREFLIGHT_LOG"
@@ -262,7 +307,7 @@ command_exists docker || fail "未安装 Docker"
 docker version >/dev/null 2>&1 || fail "Docker daemon 不可用"
 docker compose version >/dev/null 2>&1 || fail "需要 Docker Compose v2"
 docker buildx version >/dev/null 2>&1 || fail "需要 Docker Buildx"
-for cmd in awk grep df; do command_exists "$cmd" || fail "缺少命令: $cmd"; done
+for cmd in awk grep df tar; do command_exists "$cmd" || fail "缺少命令: $cmd"; done
 
 DOCKER_ARCH_RAW="$(docker info --format '{{.Architecture}}' 2>/dev/null || true)"
 DOCKER_ARCH="$(normalize_arch "$DOCKER_ARCH_RAW" 2>/dev/null || true)"
@@ -288,15 +333,30 @@ ensure_env_key CASTBRIDGE_RECEIVER_NAME CastBridge
 ensure_env_key CASTBRIDGE_LOG_LEVEL INFO
 ensure_env_key CASTBRIDGE_RECEIVER_STALE_SECONDS 10
 ensure_env_key UXPLAY_VERSION 1.74
+ensure_env_key UXPLAY_SOURCE_URL ""
+ensure_env_key UXPLAY_SHA256 ""
 ensure_env_key CASTBRIDGE_AIRPLAY_PORT 7100
 ensure_env_key CASTBRIDGE_RTP_VIDEO_PORT 5000
 ensure_env_key CASTBRIDGE_RTP_AUDIO_PORT 5002
+ensure_env_key DEBIAN_MIRROR http://mirrors.aliyun.com/debian
+ensure_env_key DEBIAN_SECURITY_MIRROR http://mirrors.aliyun.com/debian-security
+ensure_env_key PYPI_INDEX_URL https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+ensure_env_key NPM_REGISTRY https://registry.npmmirror.com
+ensure_env_key DEBIAN_BASE_IMAGE debian:bookworm-slim
+ensure_env_key PYTHON_BASE_IMAGE python:3.12-slim
+ensure_env_key NODE_BASE_IMAGE node:22-alpine
+ensure_env_key NGINX_BASE_IMAGE nginx:1.27-alpine
 
 WEB_PORT="$(env_get CASTBRIDGE_WEB_PORT)"
 AIRPLAY_PORT="$(env_get CASTBRIDGE_AIRPLAY_PORT)"
 VIDEO_RTP_PORT="$(env_get CASTBRIDGE_RTP_VIDEO_PORT)"
 AUDIO_RTP_PORT="$(env_get CASTBRIDGE_RTP_AUDIO_PORT)"
 RECEIVER_NAME="$(env_get CASTBRIDGE_RECEIVER_NAME)"
+UXPLAY_VERSION="$(env_get UXPLAY_VERSION)"
+DEBIAN_BASE_IMAGE="$(env_get DEBIAN_BASE_IMAGE)"
+PYTHON_BASE_IMAGE="$(env_get PYTHON_BASE_IMAGE)"
+NODE_BASE_IMAGE="$(env_get NODE_BASE_IMAGE)"
+NGINX_BASE_IMAGE="$(env_get NGINX_BASE_IMAGE)"
 
 validate_port CASTBRIDGE_WEB_PORT "$WEB_PORT"
 validate_port CASTBRIDGE_AIRPLAY_PORT "$AIRPLAY_PORT" 1024 65533
@@ -309,6 +369,7 @@ for airplay_port in "$AIRPLAY_PORT" "$((AIRPLAY_PORT + 1))" "$((AIRPLAY_PORT + 2
   [ "$AUDIO_RTP_PORT" != "$airplay_port" ] || fail "音频 RTP 端口不能与 AirPlay 端口重复: $AUDIO_RTP_PORT"
 done
 [ -n "$RECEIVER_NAME" ] || fail "CASTBRIDGE_RECEIVER_NAME 不能为空"
+[ -n "$UXPLAY_VERSION" ] || fail "UXPLAY_VERSION 不能为空"
 
 check_web_port "$WEB_PORT"
 check_airplay_ports "$AIRPLAY_PORT"
@@ -320,10 +381,11 @@ elif [ -n "$FREE_KB" ]; then
   ok "磁盘剩余空间: 约 $((FREE_KB / 1024 / 1024)) GiB"
 fi
 
-ensure_image python:3.12-slim "$DOCKER_ARCH"
-ensure_image node:22-alpine "$DOCKER_ARCH"
-ensure_image nginx:1.27-alpine "$DOCKER_ARCH"
-ensure_image debian:bookworm-slim "$DOCKER_ARCH"
+prepare_uxplay "$UXPLAY_VERSION"
+ensure_image "$PYTHON_BASE_IMAGE" "$DOCKER_ARCH"
+ensure_image "$NODE_BASE_IMAGE" "$DOCKER_ARCH"
+ensure_image "$NGINX_BASE_IMAGE" "$DOCKER_ARCH"
+ensure_image "$DEBIAN_BASE_IMAGE" "$DOCKER_ARCH"
 
 COMPOSE=(docker compose --env-file "$ENV_FILE")
 "${COMPOSE[@]}" config >/dev/null || fail "docker compose 配置校验失败"
@@ -343,7 +405,6 @@ if [ "$NO_BUILD" = "0" ]; then
 
   : > "$BUILD_LOG"
   info "开始构建 receiver/backend/frontend（默认静默，完整日志: logs/deploy-build.log）..."
-
   set +e
   if [ "${DEPLOY_BUILD_VERBOSE:-0}" = "1" ]; then
     "${BUILD_CMD[@]}" 2>&1 | tee "$BUILD_LOG"
@@ -408,7 +469,4 @@ printf '局域网访问:     http://<本机IP>:%s\n' "$WEB_PORT"
 printf 'AirPlay 名称:   %s\n' "$RECEIVER_NAME"
 printf 'AirPlay 端口:   TCP/UDP %s-%s\n' "$AIRPLAY_PORT" "$((AIRPLAY_PORT + 2))"
 printf 'mDNS:           UDP 5353（宿主机防火墙需允许局域网访问）\n'
-printf 'RTP 预留输出:   video=%s / audio=%s\n' "$VIDEO_RTP_PORT" "$AUDIO_RTP_PORT"
-printf '\n现在可在 iPhone/iPad/Mac 的“屏幕镜像”中查找 "%s"。\n' "$RECEIVER_NAME"
-printf '如无法发现，先检查宿主机防火墙 UDP 5353，以及客户端和服务器是否处于同一局域网。\n'
-printf '\n推荐更新命令:\n  git pull && ./deploy.sh && docker image prune -f\n'
+printf 'UxPlay 源码:    vendor/uxplay/uxplay-v%s.tar.gz（本地缓存）\n' "$UXPLAY_VERSION"
