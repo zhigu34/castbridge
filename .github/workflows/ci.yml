@@ -68,6 +68,20 @@ jobs:
       - name: Build UxPlay receiver and media runtime image
         run: >-
           docker build
+          -t castbridge-receiver-ci
           --build-arg UXPLAY_VERSION=1.73.7
           --build-arg UXPLAY_ARCHIVE=vendor/uxplay/uxplay-v1.73.7.tar.gz
           -f receiver/Dockerfile .
+      - name: Smoke test WebRTC runtime
+        run: |
+          docker run --rm --entrypoint python3 castbridge-receiver-ci -c '
+          import gi, websockets
+          gi.require_version("Gst", "1.0")
+          from gi.repository import Gst
+          Gst.init(None)
+          assert Gst.ElementFactory.find("webrtcbin") is not None
+          assert Gst.ElementFactory.find("nicesrc") is not None
+          assert Gst.ElementFactory.find("rtph264depay") is not None
+          assert Gst.ElementFactory.find("rtph264pay") is not None
+          print("WebRTC runtime OK")
+          '
