@@ -30,6 +30,10 @@ class MediaBridge:
         self.run_dir = run_dir
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
+        # GStreamer/webrtcbin callbacks may run on streaming threads. Keep the
+        # asyncio loop that owns the websocket and marshal all signaling sends
+        # back onto that loop with call_soon_threadsafe().
+        self.loop = asyncio.get_running_loop()
         self.websocket: Any = None
         self.pipeline: Gst.Pipeline | None = None
         self.webrtc: Gst.Element | None = None
@@ -122,6 +126,14 @@ class MediaBridge:
         return Gst.PadProbeReturn.OK
 
     def schedule_send(self, message: dict[str, Any]) -> None:
+        if self.loop.is_closed():
+            return
+        # This method is called by both asyncio and GStreamer threads. Never
+        # call asyncio.create_task() directly here: streaming-thread callbacks
+        # do not have a running asyncio event loop.
+        self.loop.call_soon_threadsafe(self._schedule_send_on_loop, message)
+
+    def _schedule_send_on_loop(self, message: dict[str, Any]) -> None:
         if self.websocket is None:
             return
         asyncio.create_task(self.send_json(message))
