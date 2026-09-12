@@ -93,7 +93,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         bash \
         ca-certificates \
         dbus \
+        gir1.2-gst-plugins-bad-1.0 \
+        gir1.2-gst-plugins-base-1.0 \
+        gir1.2-gstreamer-1.0 \
         gstreamer1.0-libav \
+        gstreamer1.0-nice \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-plugins-base \
         gstreamer1.0-plugins-good \
@@ -103,10 +107,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libplist3 \
         libssl3 \
         procps \
+        python3 \
+        python3-gi \
+        python3-websockets \
         tzdata
 
 COPY --from=build /usr/local/bin/uxplay /usr/local/bin/uxplay
 COPY receiver/entrypoint.sh /usr/local/bin/castbridge-receiver
-RUN chmod 0755 /usr/local/bin/castbridge-receiver
+COPY receiver/media_bridge.py /usr/local/lib/castbridge/media_bridge.py
+RUN chmod 0755 /usr/local/bin/castbridge-receiver /usr/local/lib/castbridge/media_bridge.py
 
 ENTRYPOINT ["/usr/local/bin/castbridge-receiver"]
