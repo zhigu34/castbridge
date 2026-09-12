@@ -24,9 +24,14 @@ NANOSECONDS = 1_000_000_000.0
 class MediaBridge:
     def __init__(self) -> None:
         self.video_port = int(os.getenv("CASTBRIDGE_RTP_VIDEO_PORT", "5000"))
-        self.jitter_latency_ms = int(os.getenv("CASTBRIDGE_RTP_JITTER_MS", "10"))
-        if self.jitter_latency_ms < 0 or self.jitter_latency_ms > 1000:
+        requested_jitter_ms = int(os.getenv("CASTBRIDGE_RTP_JITTER_MS", "0"))
+        if requested_jitter_ms < 0 or requested_jitter_ms > 1000:
             raise ValueError("CASTBRIDGE_RTP_JITTER_MS 必须在 0-1000 范围内")
+        # The old localhost default was 10 ms. UxPlay's -vrtp stream can carry a
+        # non-advancing RTP timestamp; rtpjitterbuffer then propagates that bad
+        # clock into H.264 PTS. Treat the legacy 10 ms default as the new
+        # zero-buffer arrival-clock mode so existing .env files migrate safely.
+        self.jitter_latency_ms = 0 if requested_jitter_ms == 10 else requested_jitter_ms
         self.signaling_url = os.getenv(
             "CASTBRIDGE_WEBRTC_SIGNALING_URL",
             "ws://127.0.0.1:8090/ws/media",
@@ -347,10 +352,15 @@ class MediaBridge:
         self.active_viewer = viewer_id
         self.last_error = None
 
+        jitter_stage = (
+            f'! rtpjitterbuffer latency={self.jitter_latency_ms} drop-on-latency=true '
+            if self.jitter_latency_ms > 0
+            else ''
+        )
         description = (
             f'udpsrc name=rtpin port={self.video_port} '
             'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
-            f'! rtpjitterbuffer latency={self.jitter_latency_ms} drop-on-latency=true '
+            f'{jitter_stage}'
             '! rtph264depay '
             '! h264parse name=parser config-interval=1 '
             '! video/x-h264,stream-format=byte-stream,alignment=au '
@@ -386,8 +396,9 @@ class MediaBridge:
         result = pipeline.set_state(Gst.State.PLAYING)
         if result == Gst.StateChangeReturn.FAILURE:
             raise RuntimeError("GStreamer WebRTC pipeline 启动失败")
+        jitter_label = f"{self.jitter_latency_ms}ms" if self.jitter_latency_ms > 0 else "off/arrival-clock"
         print(
-            f"[media] viewer {viewer_id} 已连接，监听 H.264 RTP 127.0.0.1:{self.video_port}，jitter={self.jitter_latency_ms}ms",
+            f"[media] viewer {viewer_id} 已连接，监听 H.264 RTP 127.0.0.1:{self.video_port}，jitter={jitter_label}",
             flush=True,
         )
 
@@ -462,8 +473,9 @@ class MediaBridge:
                 await asyncio.sleep(2)
 
     async def run(self) -> None:
+        jitter_label = f"{self.jitter_latency_ms}ms" if self.jitter_latency_ms > 0 else "off/arrival-clock"
         print(
-            f"[media] CastBridge Media Bridge 启动，video RTP={self.video_port}，jitter={self.jitter_latency_ms}ms",
+            f"[media] CastBridge Media Bridge 启动，video RTP={self.video_port}，jitter={jitter_label}",
             flush=True,
         )
         status_task = asyncio.create_task(self.status_loop())
