@@ -1,8 +1,10 @@
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from app.config import get_settings
+from app.receiver import load_receiver_status
 
 settings = get_settings()
 
@@ -11,6 +13,13 @@ app = FastAPI(
     version="0.1.0",
     description="CastBridge 控制面与 WebRTC 信令 API",
 )
+
+
+def receiver_snapshot() -> dict[str, Any]:
+    return load_receiver_status(
+        settings.receiver_status_file,
+        stale_seconds=settings.receiver_stale_seconds,
+    )
 
 
 @app.get("/health", tags=["system"])
@@ -25,9 +34,12 @@ async def health() -> dict[str, str]:
 
 @app.get("/api/ready", tags=["system"])
 async def ready() -> dict[str, str | bool]:
+    receiver = receiver_snapshot()
     return {
         "ready": True,
         "receiver": settings.receiver_name,
+        "receiver_ready": bool(receiver["healthy"]),
+        "receiver_state": str(receiver["state"]),
         "environment": settings.environment,
     }
 
@@ -42,14 +54,22 @@ async def system_info() -> dict[str, str]:
     }
 
 
+@app.get("/api/v1/receiver", tags=["receiver"])
+async def receiver_info() -> dict[str, Any]:
+    return receiver_snapshot()
+
+
 @app.websocket("/ws/system")
 async def system_socket(websocket: WebSocket) -> None:
     await websocket.accept()
+    receiver = receiver_snapshot()
     await websocket.send_json(
         {
             "type": "system.hello",
             "payload": {
                 "receiver_name": settings.receiver_name,
+                "receiver_ready": receiver["healthy"],
+                "receiver_state": receiver["state"],
                 "version": app.version,
             },
         }
