@@ -84,6 +84,7 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         avahi-daemon \
+        avahi-utils \
         bash \
         ca-certificates \
         dbus \
