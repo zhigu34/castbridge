@@ -40,6 +40,12 @@ type Media = {
   jitter_latency_ms?: number | null
   input_fps?: number | null
   input_mbps?: number | null
+  input_rtp_clock_ratio?: number | null
+  output_rtp_clock_ratio?: number | null
+  parser_pts_clock_ratio?: number | null
+  input_rtp_timestamp_changes?: number | null
+  output_rtp_timestamp_changes?: number | null
+  parser_pts_valid_buffers?: number | null
   signaling_connected: boolean
   broker_connected: boolean
   active_viewer: string | null
@@ -124,6 +130,8 @@ const decodeFps = ref(0)
 const presentedFps = ref(0)
 const presentedFrames = ref(0)
 const presentationDropped = ref(0)
+const mediaCurrentTime = ref(0)
+const mediaTimeRate = ref(0)
 const packetsLost = ref(0)
 const packetLossPercent = ref(0)
 const framesDropped = ref(0)
@@ -155,6 +163,8 @@ let pendingCandidates: RTCIceCandidateInit[] = []
 let previousInbound: InboundSample | null = null
 let previousPresentedAt = 0
 let previousPresentedFrames = 0
+let previousMediaAt = 0
+let previousMediaTime = 0
 
 const h264Capabilities = (() => {
   if (typeof RTCRtpReceiver === 'undefined') return [] as string[]
@@ -193,13 +203,30 @@ const diagnosticHint = computed(() => {
   if (packetLossPercent.value >= 1) return '网络丢包偏高，优先检查 Wi-Fi / LAN 链路'
   if (jitterBufferMs.value >= 120) return '浏览器 jitter buffer 偏高，存在明显播放缓存'
   if (decodeMsPerFrame.value >= 20) return '单帧解码耗时偏高，可能存在解码性能压力'
+
+  const inputClock = media.value?.input_rtp_clock_ratio ?? 0
+  const parserClock = media.value?.parser_pts_clock_ratio ?? 0
+  const outputClock = media.value?.output_rtp_clock_ratio ?? 0
+  if (inputClock > 0 && Math.abs(inputClock - 1) > 0.08) {
+    return `UxPlay 输入 RTP 时间轴速度异常：${inputClock.toFixed(3)}× 实时`
+  }
+  if (inputClock > 0 && Math.abs(inputClock - 1) <= 0.08 && parserClock > 0 && Math.abs(parserClock - 1) > 0.08) {
+    return `RTP 输入时钟正常，但 depay/parser PTS 速度异常：${parserClock.toFixed(3)}×`
+  }
+  if (parserClock > 0 && Math.abs(parserClock - 1) <= 0.08 && outputClock > 0 && Math.abs(outputClock - 1) > 0.08) {
+    return `Parser PTS 正常，但 Media Bridge 输出 RTP 时钟异常：${outputClock.toFixed(3)}×`
+  }
+  if (mediaTimeRate.value > 0 && Math.abs(mediaTimeRate.value - 1) > 0.08) {
+    return `浏览器 video.currentTime 推进异常：${mediaTimeRate.value.toFixed(3)}× 实时`
+  }
+
   const inputFps = media.value?.input_fps ?? 0
   if (inputFps > 0 && inputFps < 50) return `Media Bridge 输入约 ${inputFps.toFixed(1)} FPS，上游帧率未达到 60 FPS`
   if (inputFps >= 50 && receiveFps.value > 0 && receiveFps.value + 8 < inputFps) return 'Media Bridge 输入正常，但浏览器接收帧率明显偏低'
   if (receiveFps.value >= 30 && decodeFps.value + 8 < receiveFps.value) return 'WebRTC 已收到视频帧，但浏览器解码速度明显落后'
   if (decodeFps.value >= 30 && presentedFps.value > 0 && presentedFps.value + 8 < decodeFps.value) return '浏览器已解码，但实际呈现帧率明显落后'
   if (decodeFps.value > 0 && decodeFps.value < 20) return '解码帧率偏低'
-  if (webrtcState.value === 'connected' && framesDecoded.value > 0) return '视频链路工作中，比较输入 / 接收 / 解码 / 呈现 FPS 定位瓶颈'
+  if (webrtcState.value === 'connected' && framesDecoded.value > 0) return '视频链路工作中，时钟比率接近 1.000× 时才属于正常时间轴'
   return '等待 WebRTC 视频统计'
 })
 const diagnosticText = computed(() => JSON.stringify({
@@ -222,6 +249,12 @@ const diagnosticText = computed(() => JSON.stringify({
     jitter_latency_ms: media.value?.jitter_latency_ms ?? null,
     input_fps: Number((media.value?.input_fps ?? 0).toFixed(1)),
     input_mbps: Number((media.value?.input_mbps ?? 0).toFixed(3)),
+    input_rtp_clock_ratio: Number((media.value?.input_rtp_clock_ratio ?? 0).toFixed(4)),
+    parser_pts_clock_ratio: Number((media.value?.parser_pts_clock_ratio ?? 0).toFixed(4)),
+    output_rtp_clock_ratio: Number((media.value?.output_rtp_clock_ratio ?? 0).toFixed(4)),
+    input_rtp_timestamp_changes: media.value?.input_rtp_timestamp_changes ?? 0,
+    output_rtp_timestamp_changes: media.value?.output_rtp_timestamp_changes ?? 0,
+    parser_pts_valid_buffers: media.value?.parser_pts_valid_buffers ?? 0,
   },
   video: {
     codec: codecDescription.value,
@@ -231,6 +264,8 @@ const diagnosticText = computed(() => JSON.stringify({
     receive_fps: Number(receiveFps.value.toFixed(1)),
     decode_fps: Number(decodeFps.value.toFixed(1)),
     presented_fps: Number(presentedFps.value.toFixed(1)),
+    media_current_time: Number(mediaCurrentTime.value.toFixed(3)),
+    media_time_rate: Number(mediaTimeRate.value.toFixed(4)),
     receive_mbps: Number(receiveMbps.value.toFixed(2)),
     packets_per_second: Number(packetsPerSecond.value.toFixed(0)),
     packets_received: packetsReceived.value,
@@ -295,6 +330,8 @@ function resetBrowserStats() {
   presentedFps.value = 0
   presentedFrames.value = 0
   presentationDropped.value = 0
+  mediaCurrentTime.value = 0
+  mediaTimeRate.value = 0
   packetsLost.value = 0
   packetLossPercent.value = 0
   framesDropped.value = 0
@@ -316,6 +353,8 @@ function resetBrowserStats() {
   previousInbound = null
   previousPresentedAt = 0
   previousPresentedFrames = 0
+  previousMediaAt = 0
+  previousMediaTime = 0
 }
 
 function resetPeer() {
@@ -427,18 +466,29 @@ async function pollWebRTCStats() {
     }
 
     const video = videoElement.value
-    if (video && typeof video.getVideoPlaybackQuality === 'function') {
-      const quality = video.getVideoPlaybackQuality()
+    if (video) {
       const now = performance.now()
-      const rendered = Math.max(0, quality.totalVideoFrames - quality.droppedVideoFrames)
-      presentedFrames.value = rendered
-      presentationDropped.value = quality.droppedVideoFrames
-      if (previousPresentedAt > 0 && now > previousPresentedAt) {
-        const seconds = (now - previousPresentedAt) / 1000
-        presentedFps.value = Math.max(0, rendered - previousPresentedFrames) / seconds
+      const currentTime = video.currentTime
+      mediaCurrentTime.value = currentTime
+      if (previousMediaAt > 0 && now > previousMediaAt) {
+        const seconds = (now - previousMediaAt) / 1000
+        mediaTimeRate.value = Math.max(0, currentTime - previousMediaTime) / seconds
       }
-      previousPresentedAt = now
-      previousPresentedFrames = rendered
+      previousMediaAt = now
+      previousMediaTime = currentTime
+
+      if (typeof video.getVideoPlaybackQuality === 'function') {
+        const quality = video.getVideoPlaybackQuality()
+        const rendered = Math.max(0, quality.totalVideoFrames - quality.droppedVideoFrames)
+        presentedFrames.value = rendered
+        presentationDropped.value = quality.droppedVideoFrames
+        if (previousPresentedAt > 0 && now > previousPresentedAt) {
+          const seconds = (now - previousPresentedAt) / 1000
+          presentedFps.value = Math.max(0, rendered - previousPresentedFrames) / seconds
+        }
+        previousPresentedAt = now
+        previousPresentedFrames = rendered
+      }
     }
 
     const pair = (selectedPairId ? stats.get(selectedPairId) : fallbackPair) as (RTCStats & {
@@ -657,38 +707,14 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="grid">
-        <article>
-          <span>接收器名称</span>
-          <strong>{{ receiver?.receiver_name ?? ready?.receiver ?? 'CastBridge' }}</strong>
-        </article>
-        <article>
-          <span>AirPlay Receiver</span>
-          <strong>{{ receiver?.healthy ? '正常' : '未就绪' }}</strong>
-        </article>
-        <article>
-          <span>Media Bridge</span>
-          <strong>{{ media?.healthy ? media.engine : '未就绪' }}</strong>
-        </article>
-        <article>
-          <span>视频 RTP</span>
-          <strong>{{ media?.video_active ? `活跃 · ${media.buffers} buffers` : `${receiver?.video_rtp_port ?? 5000} · 等待` }}</strong>
-        </article>
-        <article>
-          <span>浏览器接收</span>
-          <strong>{{ packetsReceived }} pkt · {{ Math.round(bytesReceived / 1024) }} KiB</strong>
-        </article>
-        <article>
-          <span>浏览器解码</span>
-          <strong>{{ framesDecoded }} frames · {{ frameSize }}</strong>
-        </article>
-        <article>
-          <span>控制面</span>
-          <strong>{{ health?.status === 'ok' ? `API 正常 · ${socketState}` : '检测中' }}</strong>
-        </article>
-        <article>
-          <span>WebRTC 信令</span>
-          <strong>{{ viewerSocketState }} · {{ media?.peer_state ?? 'idle' }}</strong>
-        </article>
+        <article><span>接收器名称</span><strong>{{ receiver?.receiver_name ?? ready?.receiver ?? 'CastBridge' }}</strong></article>
+        <article><span>AirPlay Receiver</span><strong>{{ receiver?.healthy ? '正常' : '未就绪' }}</strong></article>
+        <article><span>Media Bridge</span><strong>{{ media?.healthy ? media.engine : '未就绪' }}</strong></article>
+        <article><span>视频 RTP</span><strong>{{ media?.video_active ? `活跃 · ${media.buffers} buffers` : `${receiver?.video_rtp_port ?? 5000} · 等待` }}</strong></article>
+        <article><span>浏览器接收</span><strong>{{ packetsReceived }} pkt · {{ Math.round(bytesReceived / 1024) }} KiB</strong></article>
+        <article><span>浏览器解码</span><strong>{{ framesDecoded }} frames · {{ frameSize }}</strong></article>
+        <article><span>控制面</span><strong>{{ health?.status === 'ok' ? `API 正常 · ${socketState}` : '检测中' }}</strong></article>
+        <article><span>WebRTC 信令</span><strong>{{ viewerSocketState }} · {{ media?.peer_state ?? 'idle' }}</strong></article>
       </div>
 
       <section class="diagnostics">
@@ -706,6 +732,10 @@ onBeforeUnmount(() => {
           <article><span>WebRTC 接收 FPS</span><strong>{{ receiveFps.toFixed(1) }}</strong></article>
           <article><span>解码 FPS</span><strong>{{ decodeFps.toFixed(1) }}</strong></article>
           <article><span>实际呈现 FPS</span><strong>{{ presentedFps.toFixed(1) }}</strong></article>
+          <article><span>输入 RTP 时钟</span><strong>{{ (media?.input_rtp_clock_ratio ?? 0).toFixed(3) }}×</strong></article>
+          <article><span>Parser PTS 时钟</span><strong>{{ (media?.parser_pts_clock_ratio ?? 0).toFixed(3) }}×</strong></article>
+          <article><span>输出 RTP 时钟</span><strong>{{ (media?.output_rtp_clock_ratio ?? 0).toFixed(3) }}×</strong></article>
+          <article><span>Video 时间轴</span><strong>{{ mediaTimeRate.toFixed(3) }}×</strong></article>
           <article><span>接收码率</span><strong>{{ receiveMbps.toFixed(2) }} Mbps</strong></article>
           <article><span>丢包</span><strong>{{ packetLossPercent.toFixed(2) }}% · {{ packetsLost }}</strong></article>
           <article><span>丢帧</span><strong>{{ framesDropped }} / 呈现 {{ presentationDropped }}</strong></article>
@@ -724,6 +754,8 @@ onBeforeUnmount(() => {
           <span><b>Decoder</b>{{ decoderImplementation }}{{ powerEfficientDecoder === null ? '' : powerEfficientDecoder ? ' · HW/高效' : ' · 非高效' }}</span>
           <span><b>ICE</b>{{ icePath }}</span>
           <span><b>Media</b>{{ (media?.input_mbps ?? 0).toFixed(2) }} Mbps · jitter {{ media?.jitter_latency_ms ?? '—' }} ms</span>
+          <span><b>RTP TS changes</b>{{ media?.input_rtp_timestamp_changes ?? 0 }} → {{ media?.output_rtp_timestamp_changes ?? 0 }}</span>
+          <span><b>Parser PTS valid</b>{{ media?.parser_pts_valid_buffers ?? 0 }}</span>
           <span><b>RTP</b>{{ packetsPerSecond.toFixed(0) }} pkt/s</span>
         </div>
 
