@@ -55,6 +55,7 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       CASTBRIDGE_RTP_VIDEO_PORT: ${CASTBRIDGE_RTP_VIDEO_PORT:-5000}
+      CASTBRIDGE_RTP_JITTER_MS: ${CASTBRIDGE_RTP_JITTER_MS:-10}
       CASTBRIDGE_WEBRTC_SIGNALING_URL: ws://127.0.0.1:${CASTBRIDGE_WEB_PORT:-8090}/ws/media
       CASTBRIDGE_RUN_DIR: /run/castbridge
     volumes:
