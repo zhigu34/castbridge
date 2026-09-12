@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import base64
 import json
 import os
 import signal
@@ -21,6 +22,7 @@ RTP_CLOCK_RATE = 90000.0
 NANOSECONDS = 1_000_000_000.0
 MIN_RTP_CLOCK_CHANGES = 8
 MIN_RTP_CLOCK_SECONDS = 1.0
+OFFER_PROFILE_WAIT_SECONDS = 1.5
 
 
 class MediaBridge:
@@ -57,8 +59,15 @@ class MediaBridge:
         self.source_idr_count = 0
         self.source_sps_count = 0
         self.source_pps_count = 0
+        self.source_profile_level_id: str | None = None
+        self.source_sps_b64: str | None = None
+        self.source_pps_b64: str | None = None
+        self.offer_profile_level_id: str | None = None
         self.last_idr_at: float | None = None
         self.force_key_unit_events = 0
+        self.offer_pending = False
+        self.offer_in_progress = False
+        self.offer_timeout_task: asyncio.Task[None] | None = None
         self.last_error: str | None = None
         self.signaling_connected = False
         self.running = True
@@ -92,25 +101,28 @@ class MediaBridge:
         return int.from_bytes(header[4:8], "big")
 
     @staticmethod
-    def h264_nal_types(buffer: Gst.Buffer) -> list[int]:
+    def h264_nals(buffer: Gst.Buffer) -> list[bytes]:
         data = buffer.extract_dup(0, buffer.get_size())
-        nal_types: list[int] = []
+        boundaries: list[tuple[int, int]] = []
         index = 0
         length = len(data)
         while index + 3 < length:
-            nal_start: int | None = None
             if data[index : index + 3] == b"\x00\x00\x01":
-                nal_start = index + 3
-            elif index + 4 < length and data[index : index + 4] == b"\x00\x00\x00\x01":
-                nal_start = index + 4
-
-            if nal_start is None:
-                index += 1
+                boundaries.append((index, index + 3))
+                index += 3
                 continue
-            if nal_start < length:
-                nal_types.append(data[nal_start] & 0x1F)
-            index = nal_start + 1
-        return nal_types
+            if index + 4 <= length and data[index : index + 4] == b"\x00\x00\x00\x01":
+                boundaries.append((index, index + 4))
+                index += 4
+                continue
+            index += 1
+
+        nals: list[bytes] = []
+        for idx, (_start_code, nal_start) in enumerate(boundaries):
+            nal_end = boundaries[idx + 1][0] if idx + 1 < len(boundaries) else length
+            if nal_start < nal_end:
+                nals.append(data[nal_start:nal_end])
+        return nals
 
     def update_rtp_clock(self, direction: str, timestamp: int, now: float) -> None:
         first_ts_name = f"{direction}_rtp_first_ts"
@@ -209,6 +221,8 @@ class MediaBridge:
             "source_idr_count": self.source_idr_count,
             "source_sps_count": self.source_sps_count,
             "source_pps_count": self.source_pps_count,
+            "source_profile_level_id": self.source_profile_level_id,
+            "offer_profile_level_id": self.offer_profile_level_id,
             "last_idr_age_seconds": round(last_idr_age, 1) if last_idr_age is not None else None,
             "force_key_unit_events": self.force_key_unit_events,
             "input_fps": round(self.input_fps, 1),
@@ -300,6 +314,28 @@ class MediaBridge:
             self.update_parser_pts(buffer.pts, time.monotonic())
         return Gst.PadProbeReturn.OK
 
+    def remember_h264_parameters(self, nals: list[bytes]) -> None:
+        profile_changed = False
+        for nal in nals:
+            if not nal:
+                continue
+            nal_type = nal[0] & 0x1F
+            if nal_type == 7 and len(nal) >= 4:
+                profile_level_id = f"{nal[1]:02x}{nal[2]:02x}{nal[3]:02x}"
+                self.source_sps_b64 = base64.b64encode(nal).decode("ascii")
+                if profile_level_id != self.source_profile_level_id:
+                    self.source_profile_level_id = profile_level_id
+                    profile_changed = True
+                    print(
+                        f"[media] H.264 source profile-level-id={profile_level_id}",
+                        flush=True,
+                    )
+            elif nal_type == 8:
+                self.source_pps_b64 = base64.b64encode(nal).decode("ascii")
+
+        if profile_changed and self.offer_pending:
+            self.loop.call_soon_threadsafe(self._maybe_create_offer, False)
+
     def on_au_sample(self, sink: Gst.Element) -> Gst.FlowReturn:
         sample = sink.emit("pull-sample")
         if sample is None:
@@ -314,13 +350,15 @@ class MediaBridge:
         self.bytes += buffer.get_size()
         self.last_video_at = now
 
-        nal_types = self.h264_nal_types(buffer)
+        nals = self.h264_nals(buffer)
+        nal_types = [(nal[0] & 0x1F) for nal in nals if nal]
         idr_count = nal_types.count(5)
         if idr_count:
             self.source_idr_count += idr_count
             self.last_idr_at = now
         self.source_sps_count += nal_types.count(7)
         self.source_pps_count += nal_types.count(8)
+        self.remember_h264_parameters(nals)
 
         # Keep the RTP reorder window so fragmented H.264 reaches us as complete
         # access units. The source RTP timeline is unreliable, so retime only
@@ -383,7 +421,78 @@ class MediaBridge:
             }
         )
 
+    def configure_h264_codec_preferences(self) -> None:
+        if self.webrtc is None or self.source_profile_level_id is None:
+            return
+        transceiver = self.webrtc.emit("get-transceiver", 0)
+        if transceiver is None:
+            print("[media] 未找到 WebRTC video transceiver，跳过 H.264 profile preference", flush=True)
+            return
+
+        fields = [
+            "application/x-rtp",
+            "media=(string)video",
+            "encoding-name=(string)H264",
+            "clock-rate=(int)90000",
+            "payload=(int)96",
+            "packetization-mode=(string)1",
+            "level-asymmetry-allowed=(string)1",
+            f"profile-level-id=(string){self.source_profile_level_id}",
+        ]
+        if self.source_sps_b64 and self.source_pps_b64:
+            fields.append(
+                f'sprop-parameter-sets=(string)"{self.source_sps_b64},{self.source_pps_b64}"'
+            )
+        caps = Gst.Caps.from_string(",".join(fields))
+        transceiver.set_property("codec-preferences", caps)
+        self.offer_profile_level_id = self.source_profile_level_id
+        print(
+            f"[media] WebRTC H.264 codec preference profile-level-id={self.offer_profile_level_id}",
+            flush=True,
+        )
+
+    async def _offer_after_timeout(self) -> None:
+        try:
+            await asyncio.sleep(OFFER_PROFILE_WAIT_SECONDS)
+            self._maybe_create_offer(True)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self.offer_timeout_task = None
+
+    def _maybe_create_offer(self, force: bool = False) -> None:
+        if self.webrtc is None or not self.active_viewer or not self.offer_pending:
+            return
+        if self.offer_in_progress:
+            return
+
+        if self.source_profile_level_id is None and not force:
+            if self.offer_timeout_task is None:
+                self.offer_timeout_task = asyncio.create_task(self._offer_after_timeout())
+            return
+
+        if self.offer_timeout_task is not None:
+            self.offer_timeout_task.cancel()
+            self.offer_timeout_task = None
+
+        if self.source_profile_level_id is not None:
+            self.configure_h264_codec_preferences()
+        else:
+            print(
+                "[media] 等待源 SPS 超时，使用通用 H.264 codec preference 生成 offer",
+                flush=True,
+            )
+
+        self.offer_pending = False
+        self.offer_in_progress = True
+        promise = Gst.Promise.new_with_change_func(self.on_offer_created, self.webrtc, None)
+        self.webrtc.emit("create-offer", None, promise)
+
+    def _offer_finished(self) -> None:
+        self.offer_in_progress = False
+
     def on_offer_created(self, promise: Gst.Promise, _element: Gst.Element, _data: Any) -> None:
+        self.loop.call_soon_threadsafe(self._offer_finished)
         if self.webrtc is None or not self.active_viewer:
             return
         promise.wait()
@@ -404,13 +513,16 @@ class MediaBridge:
         )
         print(f"[media] 已向 viewer {self.active_viewer} 发送 SDP offer", flush=True)
 
-    def on_negotiation_needed(self, element: Gst.Element) -> None:
+    def on_negotiation_needed(self, _element: Gst.Element) -> None:
         if not self.active_viewer:
             return
-        promise = Gst.Promise.new_with_change_func(self.on_offer_created, element, None)
-        element.emit("create-offer", None, promise)
+        self.offer_pending = True
+        self.loop.call_soon_threadsafe(self._maybe_create_offer, False)
 
     def stop_peer(self) -> None:
+        if self.offer_timeout_task is not None:
+            self.offer_timeout_task.cancel()
+            self.offer_timeout_task = None
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
         self.pipeline = None
@@ -431,8 +543,14 @@ class MediaBridge:
         self.source_idr_count = 0
         self.source_sps_count = 0
         self.source_pps_count = 0
+        self.source_profile_level_id = None
+        self.source_sps_b64 = None
+        self.source_pps_b64 = None
+        self.offer_profile_level_id = None
         self.last_idr_at = None
         self.force_key_unit_events = 0
+        self.offer_pending = False
+        self.offer_in_progress = False
         self.reset_clock_metrics()
 
     def start_peer(self, viewer_id: str) -> None:
