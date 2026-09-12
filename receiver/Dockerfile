@@ -52,6 +52,7 @@ RUN set -eux; \
 RUN cmake -S . -B build \
       -DCMAKE_BUILD_TYPE=Release \
       -DNO_MARCH_NATIVE=ON \
+      -DNO_X11_DEPS=ON \
     && cmake --build build --parallel "$(nproc)" \
     && cmake --install build
 
