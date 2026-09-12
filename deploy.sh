@@ -147,34 +147,62 @@ ensure_image() {
   ok "基础镜像准备完成: $image"
 }
 
+sha256_file() {
+  sha256sum "$1" | awk '{print $1}'
+}
+
 validate_uxplay_archive() {
-  local file="$1"
+  local file="$1" expected_sha="${2:-}" actual_sha
   [ -s "$file" ] || return 1
+
+  # 必须完整读取 tar 列表，不能使用 `tar | grep -q`。
+  # deploy.sh 启用了 pipefail；grep -q 提前退出会让 tar 收到 SIGPIPE，
+  # 从而把正常的 UxPlay 源码包误判成损坏。
   tar -tzf "$file" >/dev/null 2>&1 || return 1
-  tar -tzf "$file" 2>/dev/null | grep -Eq '^[^/]+/CMakeLists\.txt$'
+  tar -tzf "$file" 2>/dev/null \
+    | awk '/^[^/]+\/CMakeLists\.txt$/ {found=1} END {exit !found}' \
+    || return 1
+
+  if [ -n "$expected_sha" ]; then
+    actual_sha="$(sha256_file "$file")"
+    [ "$(printf '%s' "$actual_sha" | tr '[:upper:]' '[:lower:]')" = \
+      "$(printf '%s' "$expected_sha" | tr '[:upper:]' '[:lower:]')" ] || return 1
+  fi
 }
 
 prepare_uxplay() {
   local version="$1" expected source_url sha candidate
   expected="$ROOT_DIR/vendor/uxplay/uxplay-v${version}.tar.gz"
+  source_url="$(env_get UXPLAY_SOURCE_URL || true)"
+  sha="$(env_get UXPLAY_SHA256 || true)"
   mkdir -p "$ROOT_DIR/vendor/uxplay"
 
-  if validate_uxplay_archive "$expected"; then
+  if validate_uxplay_archive "$expected" "$sha"; then
     ok "UxPlay 本地源码包有效: vendor/uxplay/uxplay-v${version}.tar.gz"
     return 0
   fi
 
   if [ -e "$expected" ]; then
-    warn "UxPlay 本地源码包损坏，已隔离"
+    warn "UxPlay 本地源码包校验失败，已隔离"
     mv -f "$expected" "${expected}.invalid.$(date +%s)"
   fi
+
+  # 旧版 deploy.sh 曾因 pipefail + grep -q 把正常源码包误标为 invalid。
+  # 先重新校验这些历史文件，能恢复就不重复下载。
+  while IFS= read -r -d '' candidate; do
+    if validate_uxplay_archive "$candidate" "$sha"; then
+      mv -f "$candidate" "$expected"
+      ok "已恢复此前误判的 UxPlay 本地源码包"
+      return 0
+    fi
+  done < <(find "$ROOT_DIR/vendor/uxplay" -maxdepth 1 -type f -name "uxplay-v${version}.tar.gz.invalid.*" -print0 | sort -zr)
 
   for candidate in \
     "$ROOT_DIR/UxPlay-${version}.tar.gz" \
     "$ROOT_DIR/uxplay-v${version}.tar.gz" \
     "$ROOT_DIR/vendor/uxplay/UxPlay-${version}.tar.gz"; do
-    if validate_uxplay_archive "$candidate"; then
-      mv "$candidate" "$expected"
+    if validate_uxplay_archive "$candidate" "$sha"; then
+      mv -f "$candidate" "$expected"
       ok "检测到已下载 UxPlay 源码包并自动归位"
       return 0
     fi
@@ -184,8 +212,6 @@ prepare_uxplay() {
   [ -f "$ROOT_DIR/scripts/download-uxplay.sh" ] || fail "缺少 scripts/download-uxplay.sh"
   command_exists curl || fail "需要 curl 下载 UxPlay，或手工放置 $expected"
 
-  source_url="$(env_get UXPLAY_SOURCE_URL || true)"
-  sha="$(env_get UXPLAY_SHA256 || true)"
   info "UxPlay 本地源码包缺失，准备下载 v${version}..."
   UXPLAY_SOURCE_URL="$source_url" \
   UXPLAY_SHA256="$sha" \
@@ -193,12 +219,8 @@ prepare_uxplay() {
   GITHUB_PROXY_PROMPT="${GITHUB_PROXY_PROMPT:-1}" \
     bash "$ROOT_DIR/scripts/download-uxplay.sh" "$version" || fail "UxPlay 下载失败"
 
-  validate_uxplay_archive "$expected" || fail "UxPlay 源码包校验失败: $expected"
+  validate_uxplay_archive "$expected" "$sha" || fail "UxPlay 源码包校验失败: $expected"
   ok "UxPlay 本地源码包准备完成"
-}
-
-sha256_file() {
-  sha256sum "$1" | awk '{print $1}'
 }
 
 fingerprint_file() {
@@ -238,7 +260,7 @@ fingerprint_tree() {
 service_fingerprint() {
   local service="$1" archive
   {
-    printf 'fingerprint-version:2\n'
+    printf 'fingerprint-version:3\n'
     fingerprint_file "$ROOT_DIR/.dockerignore"
     case "$service" in
       receiver)
@@ -447,7 +469,7 @@ command_exists docker || fail "未安装 Docker"
 docker version >/dev/null 2>&1 || fail "Docker daemon 不可用"
 docker compose version >/dev/null 2>&1 || fail "需要 Docker Compose v2"
 docker buildx version >/dev/null 2>&1 || fail "需要 Docker Buildx"
-for cmd in awk grep df tar find sort sha256sum; do command_exists "$cmd" || fail "缺少命令: $cmd"; done
+for cmd in awk grep df tar find sort sha256sum tr; do command_exists "$cmd" || fail "缺少命令: $cmd"; done
 
 DOCKER_ARCH_RAW="$(docker info --format '{{.Architecture}}' 2>/dev/null || true)"
 DOCKER_ARCH="$(normalize_arch "$DOCKER_ARCH_RAW" 2>/dev/null || true)"
