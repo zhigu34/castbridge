@@ -1,6 +1,34 @@
 name: castbridge
 
 services:
+  receiver:
+    build:
+      context: .
+      dockerfile: receiver/Dockerfile
+      args:
+        UXPLAY_VERSION: ${UXPLAY_VERSION:-1.74}
+    container_name: castbridge-receiver
+    init: true
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      CASTBRIDGE_RECEIVER_NAME: ${CASTBRIDGE_RECEIVER_NAME:-CastBridge}
+      CASTBRIDGE_AIRPLAY_PORT: ${CASTBRIDGE_AIRPLAY_PORT:-7100}
+      CASTBRIDGE_RTP_VIDEO_PORT: ${CASTBRIDGE_RTP_VIDEO_PORT:-5000}
+      CASTBRIDGE_RTP_AUDIO_PORT: ${CASTBRIDGE_RTP_AUDIO_PORT:-5002}
+      CASTBRIDGE_RUN_DIR: /run/castbridge
+      CASTBRIDGE_LOG_DIR: /var/log/castbridge
+    volumes:
+      - ./run:/run/castbridge
+      - ./logs:/var/log/castbridge
+    healthcheck:
+      test: ["CMD-SHELL", "test -r /run/castbridge/receiver.pid && kill -0 $$(cat /run/castbridge/receiver.pid)"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
   backend:
     build:
       context: .
@@ -13,6 +41,10 @@ services:
       CASTBRIDGE_ENVIRONMENT: ${CASTBRIDGE_ENVIRONMENT:-production}
       CASTBRIDGE_RECEIVER_NAME: ${CASTBRIDGE_RECEIVER_NAME:-CastBridge}
       CASTBRIDGE_LOG_LEVEL: ${CASTBRIDGE_LOG_LEVEL:-INFO}
+      CASTBRIDGE_RECEIVER_STATUS_FILE: /run/castbridge/receiver-status.json
+      CASTBRIDGE_RECEIVER_STALE_SECONDS: ${CASTBRIDGE_RECEIVER_STALE_SECONDS:-10}
+    volumes:
+      - ./run:/run/castbridge:ro
     expose:
       - "8000"
     healthcheck:
