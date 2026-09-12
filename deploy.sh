@@ -260,12 +260,13 @@ fingerprint_tree() {
 service_fingerprint() {
   local service="$1" archive
   {
-    printf 'fingerprint-version:3\n'
+    printf 'fingerprint-version:4\n'
     fingerprint_file "$ROOT_DIR/.dockerignore"
     case "$service" in
       receiver)
         fingerprint_file "$ROOT_DIR/receiver/Dockerfile"
         fingerprint_file "$ROOT_DIR/receiver/entrypoint.sh"
+        fingerprint_file "$ROOT_DIR/receiver/media_bridge.py"
         archive="$ROOT_DIR/vendor/uxplay/uxplay-v${UXPLAY_VERSION}.tar.gz"
         fingerprint_file "$archive"
         printf 'UXPLAY_VERSION=%s\n' "$UXPLAY_VERSION"
