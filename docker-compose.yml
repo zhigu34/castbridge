@@ -10,7 +10,7 @@ services:
         DEBIAN_MIRROR: ${DEBIAN_MIRROR:-http://mirrors.aliyun.com/debian}
         DEBIAN_SECURITY_MIRROR: ${DEBIAN_SECURITY_MIRROR:-http://mirrors.aliyun.com/debian-security}
         UXPLAY_VERSION: ${UXPLAY_VERSION:-1.74}
-        UXPLAY_SOURCE_URL: ${UXPLAY_SOURCE_URL:-}
+        UXPLAY_ARCHIVE: vendor/uxplay/uxplay-v${UXPLAY_VERSION:-1.74}.tar.gz
         HTTP_PROXY: ${HTTP_PROXY:-}
         HTTPS_PROXY: ${HTTPS_PROXY:-}
         NO_PROXY: ${NO_PROXY:-}
