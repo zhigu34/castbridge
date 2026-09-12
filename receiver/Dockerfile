@@ -49,14 +49,9 @@ RUN set -eux; \
     rm -f /tmp/uxplay.tar.gz; \
     test -f CMakeLists.txt
 
-COPY receiver/patch-uxplay-rtp-timestamps.sh /tmp/patch-uxplay-rtp-timestamps.sh
-RUN sh /tmp/patch-uxplay-rtp-timestamps.sh \
-    && rm -f /tmp/patch-uxplay-rtp-timestamps.sh
-
 RUN cmake -S . -B build \
       -DCMAKE_BUILD_TYPE=Release \
       -DNO_MARCH_NATIVE=ON \
-      -DNO_X11_DEPS=ON \
     && cmake --build build --parallel "$(nproc)" \
     && cmake --install build
 
