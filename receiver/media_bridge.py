@@ -17,6 +17,9 @@ from gi.repository import GLib, Gst, GstSdp, GstWebRTC  # noqa: E402
 
 Gst.init(None)
 
+RTP_CLOCK_RATE = 90000.0
+NANOSECONDS = 1_000_000_000.0
+
 
 class MediaBridge:
     def __init__(self) -> None:
@@ -33,9 +36,6 @@ class MediaBridge:
         self.run_dir = run_dir
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
-        # GStreamer/webrtcbin callbacks may run on streaming threads. Keep the
-        # asyncio loop that owns the websocket and marshal all signaling sends
-        # back onto that loop with call_soon_threadsafe().
         self.loop = asyncio.get_running_loop()
         self.websocket: Any = None
         self.pipeline: Gst.Pipeline | None = None
@@ -52,6 +52,88 @@ class MediaBridge:
         self.last_error: str | None = None
         self.signaling_connected = False
         self.running = True
+        self.reset_clock_metrics()
+
+    def reset_clock_metrics(self) -> None:
+        self.input_rtp_first_ts: int | None = None
+        self.input_rtp_last_ts: int | None = None
+        self.input_rtp_first_at: float | None = None
+        self.input_rtp_last_at: float | None = None
+        self.input_rtp_clock_ratio = 0.0
+        self.input_rtp_timestamp_changes = 0
+
+        self.output_rtp_first_ts: int | None = None
+        self.output_rtp_last_ts: int | None = None
+        self.output_rtp_first_at: float | None = None
+        self.output_rtp_last_at: float | None = None
+        self.output_rtp_clock_ratio = 0.0
+        self.output_rtp_timestamp_changes = 0
+
+        self.parser_first_pts: int | None = None
+        self.parser_last_pts: int | None = None
+        self.parser_first_at: float | None = None
+        self.parser_last_at: float | None = None
+        self.parser_pts_clock_ratio = 0.0
+        self.parser_pts_valid_buffers = 0
+
+    @staticmethod
+    def rtp_timestamp(buffer: Gst.Buffer) -> int | None:
+        if buffer.get_size() < 12:
+            return None
+        header = buffer.extract_dup(0, 12)
+        if len(header) < 12 or (header[0] >> 6) != 2:
+            return None
+        return int.from_bytes(header[4:8], "big")
+
+    def update_rtp_clock(self, direction: str, timestamp: int, now: float) -> None:
+        first_ts_name = f"{direction}_rtp_first_ts"
+        last_ts_name = f"{direction}_rtp_last_ts"
+        first_at_name = f"{direction}_rtp_first_at"
+        last_at_name = f"{direction}_rtp_last_at"
+        ratio_name = f"{direction}_rtp_clock_ratio"
+        changes_name = f"{direction}_rtp_timestamp_changes"
+
+        first_ts = getattr(self, first_ts_name)
+        if first_ts is None:
+            setattr(self, first_ts_name, timestamp)
+            setattr(self, last_ts_name, timestamp)
+            setattr(self, first_at_name, now)
+            setattr(self, last_at_name, now)
+            return
+
+        last_ts = getattr(self, last_ts_name)
+        if timestamp == last_ts:
+            return
+
+        setattr(self, last_ts_name, timestamp)
+        setattr(self, last_at_name, now)
+        setattr(self, changes_name, getattr(self, changes_name) + 1)
+        first_at = getattr(self, first_at_name)
+        if first_at is None or now <= first_at:
+            return
+
+        ticks = (timestamp - first_ts) & 0xFFFFFFFF
+        rtp_seconds = ticks / RTP_CLOCK_RATE
+        wall_seconds = now - first_at
+        setattr(self, ratio_name, rtp_seconds / wall_seconds)
+
+    def update_parser_pts(self, pts: int, now: float) -> None:
+        if pts == Gst.CLOCK_TIME_NONE:
+            return
+        self.parser_pts_valid_buffers += 1
+        if self.parser_first_pts is None:
+            self.parser_first_pts = pts
+            self.parser_last_pts = pts
+            self.parser_first_at = now
+            self.parser_last_at = now
+            return
+        self.parser_last_pts = pts
+        self.parser_last_at = now
+        if self.parser_first_at is None or now <= self.parser_first_at:
+            return
+        pts_seconds = max(0.0, (pts - self.parser_first_pts) / NANOSECONDS)
+        wall_seconds = now - self.parser_first_at
+        self.parser_pts_clock_ratio = pts_seconds / wall_seconds
 
     def update_input_rate(self, now: float) -> None:
         elapsed = now - self.rate_sample_at
@@ -98,6 +180,12 @@ class MediaBridge:
             "jitter_latency_ms": self.jitter_latency_ms,
             "input_fps": round(self.input_fps, 1),
             "input_mbps": round(self.input_mbps, 3),
+            "input_rtp_clock_ratio": round(self.input_rtp_clock_ratio, 4),
+            "output_rtp_clock_ratio": round(self.output_rtp_clock_ratio, 4),
+            "parser_pts_clock_ratio": round(self.parser_pts_clock_ratio, 4),
+            "input_rtp_timestamp_changes": self.input_rtp_timestamp_changes,
+            "output_rtp_timestamp_changes": self.output_rtp_timestamp_changes,
+            "parser_pts_valid_buffers": self.parser_pts_valid_buffers,
             "signaling_connected": self.signaling_connected,
             "active_viewer": self.active_viewer,
             "peer_state": peer_state,
@@ -141,12 +229,30 @@ class MediaBridge:
                 warning, debug = message.parse_warning()
                 print(f"[media] GStreamer WARN: {warning}: {debug or ''}", flush=True)
 
+    def on_input_rtp(self, _pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+        buffer = info.get_buffer()
+        if buffer is not None:
+            timestamp = self.rtp_timestamp(buffer)
+            if timestamp is not None:
+                self.update_rtp_clock("input", timestamp, time.monotonic())
+        return Gst.PadProbeReturn.OK
+
+    def on_output_rtp(self, _pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+        buffer = info.get_buffer()
+        if buffer is not None:
+            timestamp = self.rtp_timestamp(buffer)
+            if timestamp is not None:
+                self.update_rtp_clock("output", timestamp, time.monotonic())
+        return Gst.PadProbeReturn.OK
+
     def on_video_buffer(self, _pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
         buffer = info.get_buffer()
         if buffer is not None:
+            now = time.monotonic()
             self.buffers += 1
             self.bytes += buffer.get_size()
-            self.last_video_at = time.monotonic()
+            self.last_video_at = now
+            self.update_parser_pts(buffer.pts, now)
         return Gst.PadProbeReturn.OK
 
     def schedule_send(self, message: dict[str, Any]) -> None:
@@ -234,25 +340,21 @@ class MediaBridge:
         self.rate_sample_at = time.monotonic()
         self.rate_sample_buffers = 0
         self.rate_sample_bytes = 0
+        self.reset_clock_metrics()
 
     def start_peer(self, viewer_id: str) -> None:
         self.stop_peer()
         self.active_viewer = viewer_id
         self.last_error = None
 
-        # UxPlay and Media Bridge run on the same host, so only a very small RTP
-        # reorder window is needed. Keep the jitterbuffer for packet ordering,
-        # but default it to 10 ms to avoid unnecessary playout latency.
-        # H.264 remains codec-transparent: repeat SPS/PPS periodically and avoid
-        # STAP-A aggregation for broad browser/hardware-decoder compatibility.
         description = (
-            f'udpsrc port={self.video_port} '
+            f'udpsrc name=rtpin port={self.video_port} '
             'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
             f'! rtpjitterbuffer latency={self.jitter_latency_ms} drop-on-latency=true '
             '! rtph264depay '
             '! h264parse name=parser config-interval=1 '
             '! video/x-h264,stream-format=byte-stream,alignment=au '
-            '! rtph264pay pt=96 mtu=1200 config-interval=1 aggregate-mode=none '
+            '! rtph264pay name=pay pt=96 mtu=1200 config-interval=1 aggregate-mode=none '
             '! application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96,packetization-mode=(string)1 '
             '! webrtcbin name=webrtc bundle-policy=max-bundle'
         )
@@ -262,13 +364,21 @@ class MediaBridge:
 
         self.pipeline = pipeline
         self.webrtc = pipeline.get_by_name("webrtc")
+        rtpin = pipeline.get_by_name("rtpin")
         parser = pipeline.get_by_name("parser")
-        if self.webrtc is None or parser is None:
+        pay = pipeline.get_by_name("pay")
+        if self.webrtc is None or rtpin is None or parser is None or pay is None:
             raise RuntimeError("WebRTC pipeline 缺少必要元素")
 
+        input_pad = rtpin.get_static_pad("src")
+        if input_pad is not None:
+            input_pad.add_probe(Gst.PadProbeType.BUFFER, self.on_input_rtp)
         parser_pad = parser.get_static_pad("src")
         if parser_pad is not None:
             parser_pad.add_probe(Gst.PadProbeType.BUFFER, self.on_video_buffer)
+        output_pad = pay.get_static_pad("src")
+        if output_pad is not None:
+            output_pad.add_probe(Gst.PadProbeType.BUFFER, self.on_output_rtp)
 
         self.webrtc.connect("on-negotiation-needed", self.on_negotiation_needed)
         self.webrtc.connect("on-ice-candidate", self.on_ice_candidate)
