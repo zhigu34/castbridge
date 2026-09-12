@@ -211,19 +211,19 @@ class MediaBridge:
         self.active_viewer = viewer_id
         self.last_error = None
 
-        # UxPlay sends decrypted H.264 RTP. Normalize the elementary stream to
-        # AVC access units, then packetize it in WebRTC-friendly non-interleaved
-        # mode (packetization-mode=1). MTU 1200 avoids oversized UDP packets on
-        # common LAN/VPN paths while still keeping the stream zero-copy at the
-        # codec level (no decode/re-encode).
+        # Keep the AirPlay H.264 bitstream codec-transparent, but normalize NAL
+        # access units for browser WebRTC receivers. Repeat SPS/PPS once per
+        # second so a viewer joining an already-running AirPlay session can
+        # acquire decoder configuration promptly. Avoid STAP-A aggregation for
+        # maximum browser/hardware-decoder compatibility.
         description = (
             f'udpsrc port={self.video_port} '
             'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
             '! rtpjitterbuffer latency=50 drop-on-latency=true '
             '! rtph264depay '
-            '! h264parse name=parser config-interval=-1 '
-            '! video/x-h264,stream-format=avc,alignment=au '
-            '! rtph264pay pt=96 mtu=1200 config-interval=-1 aggregate-mode=zero-latency '
+            '! h264parse name=parser config-interval=1 '
+            '! video/x-h264,stream-format=byte-stream,alignment=au '
+            '! rtph264pay pt=96 mtu=1200 config-interval=1 aggregate-mode=none '
             '! application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96,packetization-mode=(string)1 '
             '! webrtcbin name=webrtc bundle-policy=max-bundle'
         )
