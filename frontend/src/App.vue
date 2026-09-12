@@ -68,11 +68,16 @@ const viewerSocketState = ref<'连接中' | '已连接' | '未连接'>('连接�
 const webrtcState = ref('等待 Media Bridge')
 const viewerId = ref('')
 const videoElement = ref<HTMLVideoElement | null>(null)
+const packetsReceived = ref(0)
+const bytesReceived = ref(0)
+const framesDecoded = ref(0)
+const frameSize = ref('—')
 
 let socket: WebSocket | null = null
 let viewerSocket: WebSocket | null = null
 let peer: RTCPeerConnection | null = null
 let statusTimer: number | null = null
+let statsTimer: number | null = null
 let viewerReconnectTimer: number | null = null
 let disposed = false
 let pendingCandidates: RTCIceCandidateInit[] = []
@@ -82,6 +87,7 @@ const isReady = computed(() => (
   && receiver.value?.healthy === true
   && media.value?.healthy === true
 ))
+const browserHasFrames = computed(() => framesDecoded.value > 0)
 const receiverStateText = computed(() => {
   if (!receiver.value) return '检测中'
   if (receiver.value.healthy) return 'AirPlay 已就绪'
@@ -90,7 +96,9 @@ const receiverStateText = computed(() => {
   return receiver.value.message || receiver.value.state
 })
 const streamStateText = computed(() => {
-  if (webrtcState.value === 'connected') return 'WebRTC 已连接'
+  if (webrtcState.value === 'connected' && framesDecoded.value > 0) return 'WebRTC 视频已解码'
+  if (webrtcState.value === 'connected' && packetsReceived.value > 0) return '已收到 WebRTC RTP，但浏览器尚未解码 H.264'
+  if (webrtcState.value === 'connected') return 'WebRTC 已连接，等待视频包'
   if (media.value?.streaming) return 'H.264 视频流已到达 Media Bridge'
   if (media.value?.active_viewer) return '正在协商 WebRTC'
   if (media.value?.healthy) return '等待浏览器视频会话'
@@ -126,16 +134,51 @@ function connectSocket() {
   socket.onerror = () => { socketState.value = '未连接' }
 }
 
+function resetBrowserStats() {
+  packetsReceived.value = 0
+  bytesReceived.value = 0
+  framesDecoded.value = 0
+  frameSize.value = '—'
+}
+
 function resetPeer() {
   peer?.close()
   peer = null
   pendingCandidates = []
+  resetBrowserStats()
   if (videoElement.value) videoElement.value.srcObject = null
 }
 
 function sendViewer(message: Record<string, unknown>) {
   if (viewerSocket?.readyState === WebSocket.OPEN) {
     viewerSocket.send(JSON.stringify(message))
+  }
+}
+
+async function pollWebRTCStats() {
+  const connection = peer
+  if (!connection) return
+  try {
+    const stats = await connection.getStats()
+    stats.forEach((report) => {
+      const row = report as RTCStats & {
+        type: string
+        kind?: string
+        mediaType?: string
+        packetsReceived?: number
+        bytesReceived?: number
+        framesDecoded?: number
+        frameWidth?: number
+        frameHeight?: number
+      }
+      if (row.type !== 'inbound-rtp' || (row.kind ?? row.mediaType) !== 'video') return
+      packetsReceived.value = row.packetsReceived ?? 0
+      bytesReceived.value = row.bytesReceived ?? 0
+      framesDecoded.value = row.framesDecoded ?? 0
+      if (row.frameWidth && row.frameHeight) frameSize.value = `${row.frameWidth}×${row.frameHeight}`
+    })
+  } catch {
+    // Peer may disappear while a reconnect is in progress.
   }
 }
 
@@ -260,6 +303,7 @@ function connectViewerSocket() {
 onMounted(() => {
   void loadStatus()
   statusTimer = window.setInterval(() => void loadStatus(), 3000)
+  statsTimer = window.setInterval(() => void pollWebRTCStats(), 1000)
   connectSocket()
   connectViewerSocket()
 })
@@ -270,6 +314,7 @@ onBeforeUnmount(() => {
   viewerSocket?.close()
   resetPeer()
   if (statusTimer !== null) window.clearInterval(statusTimer)
+  if (statsTimer !== null) window.clearInterval(statsTimer)
   if (viewerReconnectTimer !== null) window.clearTimeout(viewerReconnectTimer)
 })
 </script>
@@ -297,11 +342,12 @@ onBeforeUnmount(() => {
         <span class="tag">{{ health?.version ?? 'v0.2.0' }}</span>
       </div>
 
-      <div class="viewer-card" :class="{ active: webrtcState === 'connected' }">
+      <div class="viewer-card" :class="{ active: browserHasFrames }">
         <video ref="videoElement" autoplay playsinline muted />
-        <div v-if="webrtcState !== 'connected'" class="viewer-placeholder">
+        <div v-if="!browserHasFrames" class="viewer-placeholder">
           <strong>{{ streamStateText }}</strong>
-          <span>在 Apple 设备中打开“屏幕镜像”并选择 CastBridge</span>
+          <span v-if="webrtcState === 'connected'">{{ packetsReceived }} packets · {{ framesDecoded }} frames decoded</span>
+          <span v-else>在 Apple 设备中打开“屏幕镜像”并选择 CastBridge</span>
         </div>
         <div class="viewer-badge">{{ webrtcState }}</div>
       </div>
@@ -322,6 +368,14 @@ onBeforeUnmount(() => {
         <article>
           <span>视频 RTP</span>
           <strong>{{ media?.video_active ? `活跃 · ${media.buffers} buffers` : `${receiver?.video_rtp_port ?? 5000} · 等待` }}</strong>
+        </article>
+        <article>
+          <span>浏览器接收</span>
+          <strong>{{ packetsReceived }} pkt · {{ Math.round(bytesReceived / 1024) }} KiB</strong>
+        </article>
+        <article>
+          <span>浏览器解码</span>
+          <strong>{{ framesDecoded }} frames · {{ frameSize }}</strong>
         </article>
         <article>
           <span>控制面</span>
