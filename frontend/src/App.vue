@@ -37,6 +37,7 @@ type Media = {
   state: string
   engine: string
   video_rtp_port: number | null
+  jitter_latency_ms?: number | null
   signaling_connected: boolean
   broker_connected: boolean
   active_viewer: string | null
@@ -58,6 +59,46 @@ type SignalMessage = {
   sdp_mline_index?: number
 }
 
+type InboundVideoStats = RTCStats & {
+  type: string
+  kind?: string
+  mediaType?: string
+  codecId?: string
+  packetsReceived?: number
+  packetsLost?: number
+  bytesReceived?: number
+  framesDecoded?: number
+  framesDropped?: number
+  keyFramesDecoded?: number
+  frameWidth?: number
+  frameHeight?: number
+  jitter?: number
+  jitterBufferDelay?: number
+  jitterBufferEmittedCount?: number
+  totalDecodeTime?: number
+  totalProcessingDelay?: number
+  freezeCount?: number
+  totalFreezesDuration?: number
+  nackCount?: number
+  pliCount?: number
+  firCount?: number
+  decoderImplementation?: string
+  powerEfficientDecoder?: boolean
+}
+
+type InboundSample = {
+  timestamp: number
+  packetsReceived: number
+  packetsLost: number
+  bytesReceived: number
+  framesDecoded: number
+  framesDropped: number
+  jitterBufferDelay: number
+  jitterBufferEmittedCount: number
+  totalDecodeTime: number
+  totalProcessingDelay: number
+}
+
 const health = ref<Health | null>(null)
 const ready = ref<Ready | null>(null)
 const receiver = ref<Receiver | null>(null)
@@ -72,6 +113,28 @@ const packetsReceived = ref(0)
 const bytesReceived = ref(0)
 const framesDecoded = ref(0)
 const frameSize = ref('—')
+const packetsPerSecond = ref(0)
+const receiveMbps = ref(0)
+const decodeFps = ref(0)
+const packetsLost = ref(0)
+const packetLossPercent = ref(0)
+const framesDropped = ref(0)
+const keyFramesDecoded = ref(0)
+const jitterMs = ref(0)
+const jitterBufferMs = ref(0)
+const decodeMsPerFrame = ref(0)
+const processingMsPerFrame = ref(0)
+const freezeCount = ref(0)
+const totalFreezesDuration = ref(0)
+const nackCount = ref(0)
+const pliCount = ref(0)
+const firCount = ref(0)
+const rttMs = ref(0)
+const codecDescription = ref('—')
+const decoderImplementation = ref('—')
+const powerEfficientDecoder = ref<boolean | null>(null)
+const icePath = ref('—')
+const copyState = ref('复制诊断')
 
 let socket: WebSocket | null = null
 let viewerSocket: WebSocket | null = null
@@ -81,6 +144,15 @@ let statsTimer: number | null = null
 let viewerReconnectTimer: number | null = null
 let disposed = false
 let pendingCandidates: RTCIceCandidateInit[] = []
+let previousInbound: InboundSample | null = null
+
+const h264Capabilities = (() => {
+  if (typeof RTCRtpReceiver === 'undefined') return [] as string[]
+  return (RTCRtpReceiver.getCapabilities('video')?.codecs ?? [])
+    .filter((codec) => codec.mimeType.toLowerCase() === 'video/h264')
+    .map((codec) => codec.sdpFmtpLine ?? '')
+    .filter(Boolean)
+})()
 
 const isReady = computed(() => (
   health.value?.status === 'ok'
@@ -104,6 +176,62 @@ const streamStateText = computed(() => {
   if (media.value?.healthy) return '等待浏览器视频会话'
   return media.value?.message || 'Media Bridge 检测中'
 })
+const diagnosticHint = computed(() => {
+  if (webrtcState.value === 'connected' && packetsReceived.value > 0 && framesDecoded.value === 0) {
+    return 'RTP 已到达，但 H.264 尚未产生解码帧'
+  }
+  if (packetLossPercent.value >= 1) return '网络丢包偏高，优先检查 Wi-Fi / LAN 链路'
+  if (jitterBufferMs.value >= 120) return '浏览器 jitter buffer 偏高，存在明显播放缓存'
+  if (decodeMsPerFrame.value >= 20) return '单帧解码耗时偏高，可能存在解码性能压力'
+  if (decodeFps.value > 0 && decodeFps.value < 20) return '解码帧率偏低'
+  if (webrtcState.value === 'connected' && framesDecoded.value > 0) return '视频链路工作中，重点观察 FPS、buffer 和 freeze'
+  return '等待 WebRTC 视频统计'
+})
+const diagnosticText = computed(() => JSON.stringify({
+  generated_at: new Date().toISOString(),
+  viewer_id: viewerId.value || null,
+  browser: navigator.userAgent,
+  h264_capabilities: h264Capabilities,
+  webrtc: {
+    state: webrtcState.value,
+    signaling: viewerSocketState.value,
+    ice_path: icePath.value,
+    rtt_ms: Number(rttMs.value.toFixed(1)),
+  },
+  media_bridge: {
+    state: media.value?.state ?? null,
+    peer_state: media.value?.peer_state ?? null,
+    streaming: media.value?.streaming ?? false,
+    buffers: media.value?.buffers ?? 0,
+    bytes: media.value?.bytes ?? 0,
+    jitter_latency_ms: media.value?.jitter_latency_ms ?? null,
+  },
+  video: {
+    codec: codecDescription.value,
+    decoder: decoderImplementation.value,
+    power_efficient_decoder: powerEfficientDecoder.value,
+    resolution: frameSize.value,
+    fps: Number(decodeFps.value.toFixed(1)),
+    receive_mbps: Number(receiveMbps.value.toFixed(2)),
+    packets_per_second: Number(packetsPerSecond.value.toFixed(0)),
+    packets_received: packetsReceived.value,
+    packets_lost: packetsLost.value,
+    packet_loss_percent: Number(packetLossPercent.value.toFixed(2)),
+    frames_decoded: framesDecoded.value,
+    frames_dropped: framesDropped.value,
+    keyframes_decoded: keyFramesDecoded.value,
+    rtp_jitter_ms: Number(jitterMs.value.toFixed(1)),
+    jitter_buffer_ms: Number(jitterBufferMs.value.toFixed(1)),
+    decode_ms_per_frame: Number(decodeMsPerFrame.value.toFixed(2)),
+    processing_ms_per_frame: Number(processingMsPerFrame.value.toFixed(2)),
+    freeze_count: freezeCount.value,
+    total_freeze_seconds: Number(totalFreezesDuration.value.toFixed(2)),
+    nack_count: nackCount.value,
+    pli_count: pliCount.value,
+    fir_count: firCount.value,
+  },
+  hint: diagnosticHint.value,
+}, null, 2))
 
 async function loadStatus() {
   try {
@@ -139,6 +267,28 @@ function resetBrowserStats() {
   bytesReceived.value = 0
   framesDecoded.value = 0
   frameSize.value = '—'
+  packetsPerSecond.value = 0
+  receiveMbps.value = 0
+  decodeFps.value = 0
+  packetsLost.value = 0
+  packetLossPercent.value = 0
+  framesDropped.value = 0
+  keyFramesDecoded.value = 0
+  jitterMs.value = 0
+  jitterBufferMs.value = 0
+  decodeMsPerFrame.value = 0
+  processingMsPerFrame.value = 0
+  freezeCount.value = 0
+  totalFreezesDuration.value = 0
+  nackCount.value = 0
+  pliCount.value = 0
+  firCount.value = 0
+  rttMs.value = 0
+  codecDescription.value = '—'
+  decoderImplementation.value = '—'
+  powerEfficientDecoder.value = null
+  icePath.value = '—'
+  previousInbound = null
 }
 
 function resetPeer() {
@@ -160,26 +310,135 @@ async function pollWebRTCStats() {
   if (!connection) return
   try {
     const stats = await connection.getStats()
+    let inbound: InboundVideoStats | null = null
+    let selectedPairId: string | undefined
+    let fallbackPair: RTCStats | null = null
+
     stats.forEach((report) => {
       const row = report as RTCStats & {
         type: string
         kind?: string
         mediaType?: string
-        packetsReceived?: number
-        bytesReceived?: number
-        framesDecoded?: number
-        frameWidth?: number
-        frameHeight?: number
+        selectedCandidatePairId?: string
+        nominated?: boolean
+        state?: string
       }
-      if (row.type !== 'inbound-rtp' || (row.kind ?? row.mediaType) !== 'video') return
-      packetsReceived.value = row.packetsReceived ?? 0
-      bytesReceived.value = row.bytesReceived ?? 0
-      framesDecoded.value = row.framesDecoded ?? 0
-      if (row.frameWidth && row.frameHeight) frameSize.value = `${row.frameWidth}×${row.frameHeight}`
+      if (row.type === 'inbound-rtp' && (row.kind ?? row.mediaType) === 'video') {
+        inbound = row as InboundVideoStats
+      }
+      if (row.type === 'transport' && row.selectedCandidatePairId) {
+        selectedPairId = row.selectedCandidatePairId
+      }
+      if (row.type === 'candidate-pair' && row.nominated && row.state === 'succeeded') {
+        fallbackPair = row
+      }
     })
+
+    if (inbound) {
+      const row = inbound as InboundVideoStats
+      const current: InboundSample = {
+        timestamp: row.timestamp,
+        packetsReceived: row.packetsReceived ?? 0,
+        packetsLost: row.packetsLost ?? 0,
+        bytesReceived: row.bytesReceived ?? 0,
+        framesDecoded: row.framesDecoded ?? 0,
+        framesDropped: row.framesDropped ?? 0,
+        jitterBufferDelay: row.jitterBufferDelay ?? 0,
+        jitterBufferEmittedCount: row.jitterBufferEmittedCount ?? 0,
+        totalDecodeTime: row.totalDecodeTime ?? 0,
+        totalProcessingDelay: row.totalProcessingDelay ?? 0,
+      }
+
+      packetsReceived.value = current.packetsReceived
+      bytesReceived.value = current.bytesReceived
+      framesDecoded.value = current.framesDecoded
+      packetsLost.value = current.packetsLost
+      framesDropped.value = current.framesDropped
+      keyFramesDecoded.value = row.keyFramesDecoded ?? 0
+      jitterMs.value = (row.jitter ?? 0) * 1000
+      freezeCount.value = row.freezeCount ?? 0
+      totalFreezesDuration.value = row.totalFreezesDuration ?? 0
+      nackCount.value = row.nackCount ?? 0
+      pliCount.value = row.pliCount ?? 0
+      firCount.value = row.firCount ?? 0
+      decoderImplementation.value = row.decoderImplementation ?? '—'
+      powerEfficientDecoder.value = row.powerEfficientDecoder ?? null
+      if (row.frameWidth && row.frameHeight) frameSize.value = `${row.frameWidth}×${row.frameHeight}`
+
+      if (previousInbound && current.timestamp > previousInbound.timestamp) {
+        const seconds = (current.timestamp - previousInbound.timestamp) / 1000
+        const packetDelta = Math.max(0, current.packetsReceived - previousInbound.packetsReceived)
+        const lostDelta = Math.max(0, current.packetsLost - previousInbound.packetsLost)
+        const byteDelta = Math.max(0, current.bytesReceived - previousInbound.bytesReceived)
+        const frameDelta = Math.max(0, current.framesDecoded - previousInbound.framesDecoded)
+        const emittedDelta = Math.max(0, current.jitterBufferEmittedCount - previousInbound.jitterBufferEmittedCount)
+        const jitterDelayDelta = Math.max(0, current.jitterBufferDelay - previousInbound.jitterBufferDelay)
+        const decodeTimeDelta = Math.max(0, current.totalDecodeTime - previousInbound.totalDecodeTime)
+        const processingDelayDelta = Math.max(0, current.totalProcessingDelay - previousInbound.totalProcessingDelay)
+
+        packetsPerSecond.value = packetDelta / seconds
+        receiveMbps.value = (byteDelta * 8) / seconds / 1_000_000
+        decodeFps.value = frameDelta / seconds
+        packetLossPercent.value = packetDelta + lostDelta > 0
+          ? (lostDelta / (packetDelta + lostDelta)) * 100
+          : 0
+        jitterBufferMs.value = emittedDelta > 0 ? (jitterDelayDelta / emittedDelta) * 1000 : 0
+        decodeMsPerFrame.value = frameDelta > 0 ? (decodeTimeDelta / frameDelta) * 1000 : 0
+        processingMsPerFrame.value = frameDelta > 0 ? (processingDelayDelta / frameDelta) * 1000 : 0
+      }
+      previousInbound = current
+
+      if (row.codecId) {
+        const codec = stats.get(row.codecId) as (RTCStats & { mimeType?: string; sdpFmtpLine?: string }) | undefined
+        if (codec) {
+          codecDescription.value = [codec.mimeType, codec.sdpFmtpLine].filter(Boolean).join(' · ') || '—'
+        }
+      }
+    }
+
+    const pair = (selectedPairId ? stats.get(selectedPairId) : fallbackPair) as (RTCStats & {
+      currentRoundTripTime?: number
+      localCandidateId?: string
+      remoteCandidateId?: string
+      protocol?: string
+    }) | undefined
+    if (pair) {
+      rttMs.value = (pair.currentRoundTripTime ?? 0) * 1000
+      const local = pair.localCandidateId
+        ? stats.get(pair.localCandidateId) as (RTCStats & { candidateType?: string; protocol?: string }) | undefined
+        : undefined
+      const remote = pair.remoteCandidateId
+        ? stats.get(pair.remoteCandidateId) as (RTCStats & { candidateType?: string }) | undefined
+        : undefined
+      const protocol = pair.protocol ?? local?.protocol ?? '?'
+      icePath.value = `${local?.candidateType ?? '?'} / ${protocol} → ${remote?.candidateType ?? '?'}`
+    }
   } catch {
     // Peer may disappear while a reconnect is in progress.
   }
+}
+
+async function copyDiagnostic() {
+  const text = diagnosticText.value
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      throw new Error('clipboard unavailable')
+    }
+    copyState.value = '已复制'
+  } catch {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    document.execCommand('copy')
+    textarea.remove()
+    copyState.value = '已复制'
+  }
+  window.setTimeout(() => { copyState.value = '复制诊断' }, 1600)
 }
 
 async function handleOffer(sdp: string) {
@@ -386,6 +645,41 @@ onBeforeUnmount(() => {
           <strong>{{ viewerSocketState }} · {{ media?.peer_state ?? 'idle' }}</strong>
         </article>
       </div>
+
+      <section class="diagnostics">
+        <div class="diagnostics-head">
+          <div>
+            <p class="eyebrow">WEBRTC DIAGNOSTICS</p>
+            <h2>实时链路诊断</h2>
+            <p>{{ diagnosticHint }}</p>
+          </div>
+          <button type="button" @click="copyDiagnostic">{{ copyState }}</button>
+        </div>
+
+        <div class="diagnostic-grid">
+          <article><span>解码 FPS</span><strong>{{ decodeFps.toFixed(1) }}</strong></article>
+          <article><span>接收码率</span><strong>{{ receiveMbps.toFixed(2) }} Mbps</strong></article>
+          <article><span>丢包</span><strong>{{ packetLossPercent.toFixed(2) }}% · {{ packetsLost }}</strong></article>
+          <article><span>丢帧</span><strong>{{ framesDropped }}</strong></article>
+          <article><span>RTP Jitter</span><strong>{{ jitterMs.toFixed(1) }} ms</strong></article>
+          <article><span>浏览器 Buffer</span><strong>{{ jitterBufferMs.toFixed(1) }} ms</strong></article>
+          <article><span>单帧解码</span><strong>{{ decodeMsPerFrame.toFixed(2) }} ms</strong></article>
+          <article><span>处理耗时</span><strong>{{ processingMsPerFrame.toFixed(2) }} ms</strong></article>
+          <article><span>RTT</span><strong>{{ rttMs.toFixed(1) }} ms</strong></article>
+          <article><span>关键帧</span><strong>{{ keyFramesDecoded }}</strong></article>
+          <article><span>Freeze</span><strong>{{ freezeCount }} · {{ totalFreezesDuration.toFixed(1) }}s</strong></article>
+          <article><span>NACK / PLI / FIR</span><strong>{{ nackCount }} / {{ pliCount }} / {{ firCount }}</strong></article>
+        </div>
+
+        <div class="diagnostic-meta">
+          <span><b>Codec</b>{{ codecDescription }}</span>
+          <span><b>Decoder</b>{{ decoderImplementation }}{{ powerEfficientDecoder === null ? '' : powerEfficientDecoder ? ' · HW/高效' : ' · 非高效' }}</span>
+          <span><b>ICE</b>{{ icePath }}</span>
+          <span><b>RTP</b>{{ packetsPerSecond.toFixed(0) }} pkt/s</span>
+        </div>
+
+        <textarea class="diagnostic-output" readonly :value="diagnosticText" aria-label="WebRTC diagnostic JSON" />
+      </section>
 
       <div v-if="error" class="error">{{ error }}</div>
 
