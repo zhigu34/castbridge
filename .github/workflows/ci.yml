@@ -43,7 +43,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate deploy script
-        run: bash -n deploy.sh
+      - name: Validate shell scripts
+        run: |
+          bash -n deploy.sh
+          bash -n receiver/entrypoint.sh
       - name: Validate Docker Compose
         run: cp .env.example .env && docker compose config >/dev/null
