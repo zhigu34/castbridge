@@ -9,8 +9,8 @@ services:
         DEBIAN_BASE_IMAGE: ${DEBIAN_BASE_IMAGE:-debian:bookworm-slim}
         DEBIAN_MIRROR: ${DEBIAN_MIRROR:-http://mirrors.aliyun.com/debian}
         DEBIAN_SECURITY_MIRROR: ${DEBIAN_SECURITY_MIRROR:-http://mirrors.aliyun.com/debian-security}
-        UXPLAY_VERSION: ${UXPLAY_VERSION:-1.74}
-        UXPLAY_ARCHIVE: vendor/uxplay/uxplay-v${UXPLAY_VERSION:-1.74}.tar.gz
+        UXPLAY_VERSION: ${UXPLAY_VERSION:-1.73.7}
+        UXPLAY_ARCHIVE: vendor/uxplay/uxplay-v${UXPLAY_VERSION:-1.73.7}.tar.gz
         HTTP_PROXY: ${HTTP_PROXY:-}
         HTTPS_PROXY: ${HTTPS_PROXY:-}
         NO_PROXY: ${NO_PROXY:-}
@@ -20,6 +20,7 @@ services:
     network_mode: host
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      UXPLAY_VERSION: ${UXPLAY_VERSION:-1.73.7}
       CASTBRIDGE_RECEIVER_NAME: ${CASTBRIDGE_RECEIVER_NAME:-CastBridge}
       CASTBRIDGE_AIRPLAY_PORT: ${CASTBRIDGE_AIRPLAY_PORT:-7100}
       CASTBRIDGE_RTP_VIDEO_PORT: ${CASTBRIDGE_RTP_VIDEO_PORT:-5000}
