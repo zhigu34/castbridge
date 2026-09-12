@@ -38,6 +38,8 @@ type Media = {
   engine: string
   video_rtp_port: number | null
   jitter_latency_ms?: number | null
+  input_fps?: number | null
+  input_mbps?: number | null
   signaling_connected: boolean
   broker_connected: boolean
   active_viewer: string | null
@@ -67,6 +69,7 @@ type InboundVideoStats = RTCStats & {
   packetsReceived?: number
   packetsLost?: number
   bytesReceived?: number
+  framesReceived?: number
   framesDecoded?: number
   framesDropped?: number
   keyFramesDecoded?: number
@@ -91,6 +94,7 @@ type InboundSample = {
   packetsReceived: number
   packetsLost: number
   bytesReceived: number
+  framesReceived: number
   framesDecoded: number
   framesDropped: number
   jitterBufferDelay: number
@@ -115,7 +119,11 @@ const framesDecoded = ref(0)
 const frameSize = ref('—')
 const packetsPerSecond = ref(0)
 const receiveMbps = ref(0)
+const receiveFps = ref(0)
 const decodeFps = ref(0)
+const presentedFps = ref(0)
+const presentedFrames = ref(0)
+const presentationDropped = ref(0)
 const packetsLost = ref(0)
 const packetLossPercent = ref(0)
 const framesDropped = ref(0)
@@ -145,6 +153,8 @@ let viewerReconnectTimer: number | null = null
 let disposed = false
 let pendingCandidates: RTCIceCandidateInit[] = []
 let previousInbound: InboundSample | null = null
+let previousPresentedAt = 0
+let previousPresentedFrames = 0
 
 const h264Capabilities = (() => {
   if (typeof RTCRtpReceiver === 'undefined') return [] as string[]
@@ -183,8 +193,13 @@ const diagnosticHint = computed(() => {
   if (packetLossPercent.value >= 1) return '网络丢包偏高，优先检查 Wi-Fi / LAN 链路'
   if (jitterBufferMs.value >= 120) return '浏览器 jitter buffer 偏高，存在明显播放缓存'
   if (decodeMsPerFrame.value >= 20) return '单帧解码耗时偏高，可能存在解码性能压力'
+  const inputFps = media.value?.input_fps ?? 0
+  if (inputFps > 0 && inputFps < 50) return `Media Bridge 输入约 ${inputFps.toFixed(1)} FPS，上游帧率未达到 60 FPS`
+  if (inputFps >= 50 && receiveFps.value > 0 && receiveFps.value + 8 < inputFps) return 'Media Bridge 输入正常，但浏览器接收帧率明显偏低'
+  if (receiveFps.value >= 30 && decodeFps.value + 8 < receiveFps.value) return 'WebRTC 已收到视频帧，但浏览器解码速度明显落后'
+  if (decodeFps.value >= 30 && presentedFps.value > 0 && presentedFps.value + 8 < decodeFps.value) return '浏览器已解码，但实际呈现帧率明显落后'
   if (decodeFps.value > 0 && decodeFps.value < 20) return '解码帧率偏低'
-  if (webrtcState.value === 'connected' && framesDecoded.value > 0) return '视频链路工作中，重点观察 FPS、buffer 和 freeze'
+  if (webrtcState.value === 'connected' && framesDecoded.value > 0) return '视频链路工作中，比较输入 / 接收 / 解码 / 呈现 FPS 定位瓶颈'
   return '等待 WebRTC 视频统计'
 })
 const diagnosticText = computed(() => JSON.stringify({
@@ -205,13 +220,17 @@ const diagnosticText = computed(() => JSON.stringify({
     buffers: media.value?.buffers ?? 0,
     bytes: media.value?.bytes ?? 0,
     jitter_latency_ms: media.value?.jitter_latency_ms ?? null,
+    input_fps: Number((media.value?.input_fps ?? 0).toFixed(1)),
+    input_mbps: Number((media.value?.input_mbps ?? 0).toFixed(3)),
   },
   video: {
     codec: codecDescription.value,
     decoder: decoderImplementation.value,
     power_efficient_decoder: powerEfficientDecoder.value,
     resolution: frameSize.value,
-    fps: Number(decodeFps.value.toFixed(1)),
+    receive_fps: Number(receiveFps.value.toFixed(1)),
+    decode_fps: Number(decodeFps.value.toFixed(1)),
+    presented_fps: Number(presentedFps.value.toFixed(1)),
     receive_mbps: Number(receiveMbps.value.toFixed(2)),
     packets_per_second: Number(packetsPerSecond.value.toFixed(0)),
     packets_received: packetsReceived.value,
@@ -219,6 +238,8 @@ const diagnosticText = computed(() => JSON.stringify({
     packet_loss_percent: Number(packetLossPercent.value.toFixed(2)),
     frames_decoded: framesDecoded.value,
     frames_dropped: framesDropped.value,
+    presented_frames: presentedFrames.value,
+    presentation_dropped: presentationDropped.value,
     keyframes_decoded: keyFramesDecoded.value,
     rtp_jitter_ms: Number(jitterMs.value.toFixed(1)),
     jitter_buffer_ms: Number(jitterBufferMs.value.toFixed(1)),
@@ -269,7 +290,11 @@ function resetBrowserStats() {
   frameSize.value = '—'
   packetsPerSecond.value = 0
   receiveMbps.value = 0
+  receiveFps.value = 0
   decodeFps.value = 0
+  presentedFps.value = 0
+  presentedFrames.value = 0
+  presentationDropped.value = 0
   packetsLost.value = 0
   packetLossPercent.value = 0
   framesDropped.value = 0
@@ -289,6 +314,8 @@ function resetBrowserStats() {
   powerEfficientDecoder.value = null
   icePath.value = '—'
   previousInbound = null
+  previousPresentedAt = 0
+  previousPresentedFrames = 0
 }
 
 function resetPeer() {
@@ -341,6 +368,7 @@ async function pollWebRTCStats() {
         packetsReceived: row.packetsReceived ?? 0,
         packetsLost: row.packetsLost ?? 0,
         bytesReceived: row.bytesReceived ?? 0,
+        framesReceived: row.framesReceived ?? row.framesDecoded ?? 0,
         framesDecoded: row.framesDecoded ?? 0,
         framesDropped: row.framesDropped ?? 0,
         jitterBufferDelay: row.jitterBufferDelay ?? 0,
@@ -370,6 +398,7 @@ async function pollWebRTCStats() {
         const packetDelta = Math.max(0, current.packetsReceived - previousInbound.packetsReceived)
         const lostDelta = Math.max(0, current.packetsLost - previousInbound.packetsLost)
         const byteDelta = Math.max(0, current.bytesReceived - previousInbound.bytesReceived)
+        const receivedFrameDelta = Math.max(0, current.framesReceived - previousInbound.framesReceived)
         const frameDelta = Math.max(0, current.framesDecoded - previousInbound.framesDecoded)
         const emittedDelta = Math.max(0, current.jitterBufferEmittedCount - previousInbound.jitterBufferEmittedCount)
         const jitterDelayDelta = Math.max(0, current.jitterBufferDelay - previousInbound.jitterBufferDelay)
@@ -378,6 +407,7 @@ async function pollWebRTCStats() {
 
         packetsPerSecond.value = packetDelta / seconds
         receiveMbps.value = (byteDelta * 8) / seconds / 1_000_000
+        receiveFps.value = receivedFrameDelta / seconds
         decodeFps.value = frameDelta / seconds
         packetLossPercent.value = packetDelta + lostDelta > 0
           ? (lostDelta / (packetDelta + lostDelta)) * 100
@@ -394,6 +424,21 @@ async function pollWebRTCStats() {
           codecDescription.value = [codec.mimeType, codec.sdpFmtpLine].filter(Boolean).join(' · ') || '—'
         }
       }
+    }
+
+    const video = videoElement.value
+    if (video && typeof video.getVideoPlaybackQuality === 'function') {
+      const quality = video.getVideoPlaybackQuality()
+      const now = performance.now()
+      const rendered = Math.max(0, quality.totalVideoFrames - quality.droppedVideoFrames)
+      presentedFrames.value = rendered
+      presentationDropped.value = quality.droppedVideoFrames
+      if (previousPresentedAt > 0 && now > previousPresentedAt) {
+        const seconds = (now - previousPresentedAt) / 1000
+        presentedFps.value = Math.max(0, rendered - previousPresentedFrames) / seconds
+      }
+      previousPresentedAt = now
+      previousPresentedFrames = rendered
     }
 
     const pair = (selectedPairId ? stats.get(selectedPairId) : fallbackPair) as (RTCStats & {
@@ -657,10 +702,13 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="diagnostic-grid">
+          <article><span>Media 输入 FPS</span><strong>{{ (media?.input_fps ?? 0).toFixed(1) }}</strong></article>
+          <article><span>WebRTC 接收 FPS</span><strong>{{ receiveFps.toFixed(1) }}</strong></article>
           <article><span>解码 FPS</span><strong>{{ decodeFps.toFixed(1) }}</strong></article>
+          <article><span>实际呈现 FPS</span><strong>{{ presentedFps.toFixed(1) }}</strong></article>
           <article><span>接收码率</span><strong>{{ receiveMbps.toFixed(2) }} Mbps</strong></article>
           <article><span>丢包</span><strong>{{ packetLossPercent.toFixed(2) }}% · {{ packetsLost }}</strong></article>
-          <article><span>丢帧</span><strong>{{ framesDropped }}</strong></article>
+          <article><span>丢帧</span><strong>{{ framesDropped }} / 呈现 {{ presentationDropped }}</strong></article>
           <article><span>RTP Jitter</span><strong>{{ jitterMs.toFixed(1) }} ms</strong></article>
           <article><span>浏览器 Buffer</span><strong>{{ jitterBufferMs.toFixed(1) }} ms</strong></article>
           <article><span>单帧解码</span><strong>{{ decodeMsPerFrame.toFixed(2) }} ms</strong></article>
@@ -675,6 +723,7 @@ onBeforeUnmount(() => {
           <span><b>Codec</b>{{ codecDescription }}</span>
           <span><b>Decoder</b>{{ decoderImplementation }}{{ powerEfficientDecoder === null ? '' : powerEfficientDecoder ? ' · HW/高效' : ' · 非高效' }}</span>
           <span><b>ICE</b>{{ icePath }}</span>
+          <span><b>Media</b>{{ (media?.input_mbps ?? 0).toFixed(2) }} Mbps · jitter {{ media?.jitter_latency_ms ?? '—' }} ms</span>
           <span><b>RTP</b>{{ packetsPerSecond.toFixed(0) }} pkt/s</span>
         </div>
 
