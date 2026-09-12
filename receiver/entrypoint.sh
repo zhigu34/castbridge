@@ -12,7 +12,7 @@ PID_FILE="$RUN_DIR/receiver.pid"
 LOG_FILE="$LOG_DIR/receiver.log"
 UXPLAY_PID=""
 
-mkdir -p "$RUN_DIR" "$LOG_DIR"
+mkdir -p "$RUN_DIR" "$LOG_DIR" /run/dbus /run/avahi-daemon
 
 validate_port() {
   local name="$1" value="$2"
@@ -34,7 +34,7 @@ write_status() {
   jq -n \
     --arg state "$state" \
     --arg receiver_name "$RECEIVER_NAME" \
-    --arg version "${UXPLAY_VERSION:-1.74}" \
+    --arg version "${UXPLAY_VERSION:-1.73.7}" \
     --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson timestamp_epoch "$(date +%s)" \
     --argjson pid "${UXPLAY_PID:-0}" \
@@ -65,18 +65,34 @@ cleanup() {
     kill -TERM "$UXPLAY_PID" 2>/dev/null || true
     wait "$UXPLAY_PID" 2>/dev/null || true
   fi
+  avahi-daemon --kill >/dev/null 2>&1 || true
   rm -f "$PID_FILE"
   write_status stopped "$rc" || true
   exit "$rc"
 }
 trap cleanup EXIT INT TERM
 
+start_mdns() {
+  dbus-uuidgen --ensure=/etc/machine-id >/dev/null 2>&1 || true
+  if [ ! -S /run/dbus/system_bus_socket ]; then
+    dbus-daemon --system --fork
+  fi
+
+  if ! avahi-daemon --daemonize --no-chroot; then
+    echo "[receiver] Avahi 启动失败；请检查宿主机是否已有冲突的 mDNS/Avahi 服务占用 UDP 5353" >&2
+    exit 1
+  fi
+  printf '[receiver] Avahi DNS-SD 已启动（UDP 5353）\n'
+}
+
 VIDEO_PIPELINE="config-interval=1 ! udpsink host=127.0.0.1 port=${VIDEO_RTP_PORT} sync=false async=false"
 AUDIO_PIPELINE="pt=96 ! udpsink host=127.0.0.1 port=${AUDIO_RTP_PORT} sync=false async=false"
 
-printf '[receiver] 启动 UxPlay %s，设备名: %s\n' "${UXPLAY_VERSION:-1.74}" "$RECEIVER_NAME"
+printf '[receiver] 启动 UxPlay %s，设备名: %s\n' "${UXPLAY_VERSION:-1.73.7}" "$RECEIVER_NAME"
 printf '[receiver] AirPlay TCP/UDP 端口: %s-%s\n' "$AIRPLAY_PORT" "$((AIRPLAY_PORT + 2))"
 printf '[receiver] RTP 输出: video=%s audio=%s\n' "$VIDEO_RTP_PORT" "$AUDIO_RTP_PORT"
+
+start_mdns
 
 /usr/local/bin/uxplay \
   -n "$RECEIVER_NAME" \
@@ -92,7 +108,7 @@ write_status ready
 while kill -0 "$UXPLAY_PID" 2>/dev/null; do
   sleep 2
   write_status ready
- done
+done
 
 set +e
 wait "$UXPLAY_PID"
