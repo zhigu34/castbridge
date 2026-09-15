@@ -72,16 +72,50 @@ jobs:
           --build-arg UXPLAY_VERSION=1.73.7
           --build-arg UXPLAY_ARCHIVE=vendor/uxplay/uxplay-v1.73.7.tar.gz
           -f receiver/Dockerfile .
-      - name: Smoke test WebRTC runtime
+      - name: Smoke test WebRTC runtime and viewer lifecycle
         run: |
           docker run --rm --entrypoint python3 castbridge-receiver-ci -c '
-          import gi, websockets
+          import asyncio
+          import importlib.util
+          import gi
+          import websockets
+
           gi.require_version("Gst", "1.0")
           from gi.repository import Gst
+
           Gst.init(None)
-          assert Gst.ElementFactory.find("webrtcbin") is not None
-          assert Gst.ElementFactory.find("nicesrc") is not None
-          assert Gst.ElementFactory.find("rtph264depay") is not None
-          assert Gst.ElementFactory.find("rtph264pay") is not None
-          print("WebRTC runtime OK")
+          for element in (
+              "webrtcbin",
+              "nicesrc",
+              "rtph264depay",
+              "rtph264pay",
+              "avdec_h264",
+              "videoconvert",
+              "x264enc",
+          ):
+              assert Gst.ElementFactory.find(element) is not None, element
+
+          spec = importlib.util.spec_from_file_location(
+              "castbridge_media_bridge",
+              "/usr/local/lib/castbridge/media_bridge.py",
+          )
+          assert spec is not None and spec.loader is not None
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+
+          async def lifecycle():
+              bridge = module.MediaBridge()
+              bridge.start_source()
+              source_pipeline = bridge.source_pipeline
+              assert source_pipeline is not None
+              bridge.start_viewer("smoke-viewer")
+              assert bridge.viewer_pipeline is not None
+              bridge.stop_viewer()
+              assert bridge.viewer_pipeline is None
+              assert bridge.source_pipeline is source_pipeline
+              bridge.stop_source()
+              assert bridge.source_pipeline is None
+
+          asyncio.run(lifecycle())
+          print("WebRTC runtime and split lifecycle OK")
           '
