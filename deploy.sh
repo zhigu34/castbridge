@@ -39,7 +39,7 @@ CastBridge 一键部署脚本
   - receiver 构建输入未变化 -> 不重建 receiver
   - backend 构建输入未变化  -> 不重建 backend
   - frontend 构建输入未变化 -> 不重建 frontend
-  - 仅运行时 .env 变化由 docker compose up 处理，不会触发无关镜像重建
+  - 正常部署会先用 .env.example 重置 .env，再执行 Compose
 
 可选环境变量:
   DEPLOY_AUTO_PULL=0       缺少基础镜像时不自动 docker pull（默认 1）
@@ -483,11 +483,14 @@ export BUILDX_BUILDER=default
 ok "构建器: default (docker driver)"
 
 [ -f "$ENV_EXAMPLE" ] || fail "缺少 .env.example"
-if [ ! -f "$ENV_FILE" ]; then
+if [ "$CHECK_ONLY" = "1" ]; then
+  ENV_FILE="$ENV_EXAMPLE"
+  info "--check-only 使用 .env.example 校验，不修改 .env"
+else
   cp "$ENV_EXAMPLE" "$ENV_FILE"
-  info "已从 .env.example 创建 .env"
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+  info "已使用 .env.example 重置 .env"
 fi
-chmod 600 "$ENV_FILE" 2>/dev/null || true
 
 ensure_env_key CASTBRIDGE_WEB_PORT 8090
 ensure_env_key TZ Asia/Shanghai
@@ -582,7 +585,7 @@ if [ "$CHECK_ONLY" = "1" ]; then
   elif [ "$NO_BUILD" = "0" ]; then
     info "增量构建计划: ${BUILD_SERVICES[*]}"
   fi
-  ok "检查完成（--check-only），未下载源码、未拉取基础镜像、未构建或启动服务"
+  ok "检查完成（--check-only），未下载源码、未拉取基础镜像、未构建、启动或修改 .env"
   exit 0
 fi
 
