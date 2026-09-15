@@ -25,6 +25,10 @@ def test_media_status() -> None:
     assert "healthy" in payload
     assert "broker_connected" in payload
     assert "viewer_count" in payload
+    assert "source_pipeline_active" in payload
+    assert "viewer_encoder" in payload
+    assert "viewer_encoded_idr_count" in payload
+    assert "viewer_force_key_unit_events" in payload
 
 
 def test_system_websocket() -> None:
