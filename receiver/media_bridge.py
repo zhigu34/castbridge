@@ -22,7 +22,6 @@ RTP_CLOCK_RATE = 90000.0
 NANOSECONDS = 1_000_000_000.0
 MIN_RTP_CLOCK_CHANGES = 8
 MIN_RTP_CLOCK_SECONDS = 1.0
-OFFER_PROFILE_WAIT_SECONDS = 1.5
 
 
 class MediaBridge:
@@ -42,11 +41,75 @@ class MediaBridge:
 
         self.loop = asyncio.get_running_loop()
         self.websocket: Any = None
-        self.pipeline: Gst.Pipeline | None = None
-        self.webrtc: Gst.Element | None = None
+
+        # Source lifetime: process -> shutdown. Browser refreshes never touch it.
+        self.source_pipeline: Gst.Pipeline | None = None
         self.au_src: Gst.Element | None = None
+
+        # Viewer lifetime: viewer.connected -> viewer.disconnected/replacement.
+        self.viewer_pipeline: Gst.Pipeline | None = None
+        self.webrtc: Gst.Element | None = None
+        self.raw_src: Gst.Element | None = None
         self.active_viewer: str | None = None
+        self.viewer_raw_caps_string: str | None = None
+
         self.last_video_at: float | None = None
+        self.buffers = 0
+        self.bytes = 0
+        self.input_fps = 0.0
+        self.input_mbps = 0.0
+        self.rate_sample_at = time.monotonic()
+        self.rate_sample_buffers = 0
+        self.rate_sample_bytes = 0
+        self.retimed_au_buffers = 0
+        self.retime_push_failures = 0
+
+        self.source_idr_count = 0
+        self.source_sps_count = 0
+        self.source_pps_count = 0
+        self.source_profile_level_id: str | None = None
+        self.source_sps_b64: str | None = None
+        self.source_pps_b64: str | None = None
+        self.last_idr_at: float | None = None
+
+        self.viewer_encoded_idr_count = 0
+        self.viewer_force_key_unit_events = 0
+        self.viewer_profile_level_id: str | None = None
+        self.viewer_sps_b64: str | None = None
+        self.viewer_pps_b64: str | None = None
+        self.offer_profile_level_id: str | None = None
+        self.viewer_push_failures = 0
+        self.offer_pending = False
+        self.offer_in_progress = False
+
+        self.source_error: str | None = None
+        self.viewer_error: str | None = None
+        self.signaling_connected = False
+        self.running = True
+        self.reset_source_clock_metrics()
+        self.reset_viewer_clock_metrics()
+
+    def reset_source_clock_metrics(self) -> None:
+        self.input_rtp_first_ts: int | None = None
+        self.input_rtp_last_ts: int | None = None
+        self.input_rtp_first_at: float | None = None
+        self.input_rtp_clock_ratio = 0.0
+        self.input_rtp_timestamp_changes = 0
+
+        self.parser_first_pts: int | None = None
+        self.parser_first_at: float | None = None
+        self.parser_pts_clock_ratio = 0.0
+        self.parser_pts_valid_buffers = 0
+
+    def reset_viewer_clock_metrics(self) -> None:
+        self.output_rtp_first_ts: int | None = None
+        self.output_rtp_last_ts: int | None = None
+        self.output_rtp_first_at: float | None = None
+        self.output_rtp_clock_ratio = 0.0
+        self.output_rtp_timestamp_changes = 0
+
+    def reset_source_metrics(self) -> None:
+        self.last_video_at = None
         self.buffers = 0
         self.bytes = 0
         self.input_fps = 0.0
@@ -59,37 +122,24 @@ class MediaBridge:
         self.source_idr_count = 0
         self.source_sps_count = 0
         self.source_pps_count = 0
-        self.source_profile_level_id: str | None = None
-        self.source_sps_b64: str | None = None
-        self.source_pps_b64: str | None = None
-        self.offer_profile_level_id: str | None = None
-        self.last_idr_at: float | None = None
-        self.force_key_unit_events = 0
+        self.source_profile_level_id = None
+        self.source_sps_b64 = None
+        self.source_pps_b64 = None
+        self.last_idr_at = None
+        self.reset_source_clock_metrics()
+
+    def reset_viewer_metrics(self) -> None:
+        self.viewer_encoded_idr_count = 0
+        self.viewer_force_key_unit_events = 0
+        self.viewer_profile_level_id = None
+        self.viewer_sps_b64 = None
+        self.viewer_pps_b64 = None
+        self.offer_profile_level_id = None
+        self.viewer_push_failures = 0
         self.offer_pending = False
         self.offer_in_progress = False
-        self.offer_timeout_task: asyncio.Task[None] | None = None
-        self.last_error: str | None = None
-        self.signaling_connected = False
-        self.running = True
-        self.reset_clock_metrics()
-
-    def reset_clock_metrics(self) -> None:
-        self.input_rtp_first_ts: int | None = None
-        self.input_rtp_last_ts: int | None = None
-        self.input_rtp_first_at: float | None = None
-        self.input_rtp_clock_ratio = 0.0
-        self.input_rtp_timestamp_changes = 0
-
-        self.output_rtp_first_ts: int | None = None
-        self.output_rtp_last_ts: int | None = None
-        self.output_rtp_first_at: float | None = None
-        self.output_rtp_clock_ratio = 0.0
-        self.output_rtp_timestamp_changes = 0
-
-        self.parser_first_pts: int | None = None
-        self.parser_first_at: float | None = None
-        self.parser_pts_clock_ratio = 0.0
-        self.parser_pts_valid_buffers = 0
+        self.viewer_raw_caps_string = None
+        self.reset_viewer_clock_metrics()
 
     @staticmethod
     def rtp_timestamp(buffer: Gst.Buffer) -> int | None:
@@ -183,6 +233,9 @@ class MediaBridge:
         self.rate_sample_buffers = self.buffers
         self.rate_sample_bytes = self.bytes
 
+    def current_error(self) -> str | None:
+        return self.source_error or self.viewer_error
+
     def write_status(self) -> None:
         now_mono = time.monotonic()
         video_age = None if self.last_video_at is None else max(0.0, now_mono - self.last_video_at)
@@ -197,7 +250,8 @@ class MediaBridge:
             except Exception:
                 peer_state = "unknown"
 
-        if self.last_error:
+        error = self.current_error()
+        if error:
             state = "error"
         elif video_active and self.active_viewer:
             state = "streaming"
@@ -210,21 +264,28 @@ class MediaBridge:
 
         payload = {
             "state": state,
-            "engine": "GStreamer/webrtcbin",
+            "engine": "GStreamer/avdec_h264+x264enc+webrtcbin",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "timestamp_epoch": int(time.time()),
             "video_rtp_port": self.video_port,
             "jitter_latency_ms": self.jitter_latency_ms,
             "retime_mode": "h264-au-arrival-clock",
+            "source_pipeline_active": self.source_pipeline is not None,
+            "viewer_encoder": "x264enc" if self.viewer_pipeline is not None else None,
+            "viewer_encoded_idr_count": self.viewer_encoded_idr_count,
+            "viewer_force_key_unit_events": self.viewer_force_key_unit_events,
+            # Backward-compatible alias used by older frontends.
+            "force_key_unit_events": self.viewer_force_key_unit_events,
+            "viewer_push_failures": self.viewer_push_failures,
             "retimed_au_buffers": self.retimed_au_buffers,
             "retime_push_failures": self.retime_push_failures,
             "source_idr_count": self.source_idr_count,
             "source_sps_count": self.source_sps_count,
             "source_pps_count": self.source_pps_count,
             "source_profile_level_id": self.source_profile_level_id,
+            "viewer_profile_level_id": self.viewer_profile_level_id,
             "offer_profile_level_id": self.offer_profile_level_id,
             "last_idr_age_seconds": round(last_idr_age, 1) if last_idr_age is not None else None,
-            "force_key_unit_events": self.force_key_unit_events,
             "input_fps": round(self.input_fps, 1),
             "input_mbps": round(self.input_mbps, 3),
             "input_rtp_clock_ratio": round(self.input_rtp_clock_ratio, 4),
@@ -240,7 +301,7 @@ class MediaBridge:
             "video_age_seconds": round(video_age, 1) if video_age is not None else None,
             "buffers": self.buffers,
             "bytes": self.bytes,
-            "error": self.last_error,
+            "error": error,
         }
         tmp = self.status_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -252,7 +313,7 @@ class MediaBridge:
         while self.running:
             while context.pending():
                 context.iteration(False)
-            self.poll_bus()
+            self.poll_buses()
             now = time.monotonic()
             if now - last_status_write >= 1.0:
                 self.update_input_rate(now)
@@ -260,21 +321,36 @@ class MediaBridge:
                 last_status_write = now
             await asyncio.sleep(0.02)
 
-    def poll_bus(self) -> None:
-        if self.pipeline is None:
+    def poll_buses(self) -> None:
+        self.poll_pipeline_bus(self.source_pipeline, "source")
+        self.poll_pipeline_bus(self.viewer_pipeline, "viewer")
+
+    def poll_pipeline_bus(self, pipeline: Gst.Pipeline | None, label: str) -> None:
+        if pipeline is None:
             return
-        bus = self.pipeline.get_bus()
+        bus = pipeline.get_bus()
         while True:
             message = bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.WARNING)
             if message is None:
                 break
             if message.type == Gst.MessageType.ERROR:
                 error, debug = message.parse_error()
-                self.last_error = f"{error}: {debug or ''}".strip()
-                print(f"[media] GStreamer ERROR: {self.last_error}", flush=True)
-            elif message.type == Gst.MessageType.WARNING:
+                detail = f"{error}: {debug or ''}".strip()
+                print(f"[media] GStreamer {label} ERROR: {detail}", flush=True)
+                if label == "source":
+                    self.source_error = detail
+                    self.stop_viewer()
+                    self.stop_source(clear_error=False)
+                else:
+                    self.viewer_error = detail
+                    self.stop_viewer(clear_error=False)
+                return
+            if message.type == Gst.MessageType.WARNING:
                 warning, debug = message.parse_warning()
-                print(f"[media] GStreamer WARN: {warning}: {debug or ''}", flush=True)
+                print(
+                    f"[media] GStreamer {label} WARN: {warning}: {debug or ''}",
+                    flush=True,
+                )
 
     def on_input_rtp(self, _pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
         buffer = info.get_buffer()
@@ -292,7 +368,11 @@ class MediaBridge:
                 self.update_rtp_clock("output", timestamp, time.monotonic())
         return Gst.PadProbeReturn.OK
 
-    def on_force_key_unit_event(self, _pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+    def on_viewer_force_key_unit_event(
+        self,
+        _pad: Gst.Pad,
+        info: Gst.PadProbeInfo,
+    ) -> Gst.PadProbeReturn:
         event = info.get_event()
         if event is None:
             return Gst.PadProbeReturn.OK
@@ -300,12 +380,10 @@ class MediaBridge:
         if structure is None or structure.get_name() != "GstForceKeyUnit":
             return Gst.PadProbeReturn.OK
 
-        self.force_key_unit_events += 1
-        if self.force_key_unit_events <= 5 or self.force_key_unit_events % 100 == 0:
-            print(
-                f"[media] 收到上游 GstForceKeyUnit #{self.force_key_unit_events}",
-                flush=True,
-            )
+        self.viewer_force_key_unit_events += 1
+        count = self.viewer_force_key_unit_events
+        if count <= 5 or count % 100 == 0:
+            print(f"[media] viewer encoder 收到 GstForceKeyUnit #{count}", flush=True)
         return Gst.PadProbeReturn.OK
 
     def on_retimed_video_buffer(self, _pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
@@ -314,8 +392,7 @@ class MediaBridge:
             self.update_parser_pts(buffer.pts, time.monotonic())
         return Gst.PadProbeReturn.OK
 
-    def remember_h264_parameters(self, nals: list[bytes]) -> None:
-        profile_changed = False
+    def remember_source_h264_parameters(self, nals: list[bytes]) -> None:
         for nal in nals:
             if not nal:
                 continue
@@ -325,7 +402,6 @@ class MediaBridge:
                 self.source_sps_b64 = base64.b64encode(nal).decode("ascii")
                 if profile_level_id != self.source_profile_level_id:
                     self.source_profile_level_id = profile_level_id
-                    profile_changed = True
                     print(
                         f"[media] H.264 source profile-level-id={profile_level_id}",
                         flush=True,
@@ -333,8 +409,38 @@ class MediaBridge:
             elif nal_type == 8:
                 self.source_pps_b64 = base64.b64encode(nal).decode("ascii")
 
+    def remember_viewer_h264_parameters(self, nals: list[bytes]) -> None:
+        profile_changed = False
+        for nal in nals:
+            if not nal:
+                continue
+            nal_type = nal[0] & 0x1F
+            if nal_type == 7 and len(nal) >= 4:
+                profile_level_id = f"{nal[1]:02x}{nal[2]:02x}{nal[3]:02x}"
+                self.viewer_sps_b64 = base64.b64encode(nal).decode("ascii")
+                if profile_level_id != self.viewer_profile_level_id:
+                    self.viewer_profile_level_id = profile_level_id
+                    profile_changed = True
+                    print(
+                        f"[media] viewer encoder profile-level-id={profile_level_id}",
+                        flush=True,
+                    )
+            elif nal_type == 8:
+                self.viewer_pps_b64 = base64.b64encode(nal).decode("ascii")
+
         if profile_changed and self.offer_pending:
-            self.loop.call_soon_threadsafe(self._maybe_create_offer, False)
+            self.loop.call_soon_threadsafe(self._maybe_create_offer)
+
+    def on_viewer_h264_buffer(self, _pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+        buffer = info.get_buffer()
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+        nals = self.h264_nals(buffer)
+        nal_types = [(nal[0] & 0x1F) for nal in nals if nal]
+        if 5 in nal_types:
+            self.viewer_encoded_idr_count += 1
+        self.remember_viewer_h264_parameters(nals)
+        return Gst.PadProbeReturn.OK
 
     def on_au_sample(self, sink: Gst.Element) -> Gst.FlowReturn:
         sample = sink.emit("pull-sample")
@@ -358,13 +464,11 @@ class MediaBridge:
             self.last_idr_at = now
         self.source_sps_count += nal_types.count(7)
         self.source_pps_count += nal_types.count(8)
-        self.remember_h264_parameters(nals)
+        self.remember_source_h264_parameters(nals)
 
-        # Keep the RTP reorder window so fragmented H.264 reaches us as complete
-        # access units. The source RTP timeline is unreliable, so retime only
-        # after a full AU exists. The appsink is deliberately non-dropping:
-        # silently dropping one predictive AU can poison the reference chain
-        # until the next IDR.
+        # UxPlay's RTP clock is unreliable. Keep complete encoded AUs intact,
+        # then create a new timeline before decoding them in the persistent
+        # source pipeline.
         out_buffer = buffer.copy_deep()
         out_buffer.pts = Gst.CLOCK_TIME_NONE
         out_buffer.dts = Gst.CLOCK_TIME_NONE
@@ -377,6 +481,51 @@ class MediaBridge:
             if self.retime_push_failures <= 5:
                 print(f"[media] AU retime push failed: {flow}", flush=True)
         return Gst.FlowReturn.OK
+
+    def on_raw_sample(self, sink: Gst.Element) -> Gst.FlowReturn:
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.EOS
+
+        viewer_id = self.active_viewer
+        raw_src = self.raw_src
+        if viewer_id is None or raw_src is None:
+            return Gst.FlowReturn.OK
+
+        buffer = sample.get_buffer()
+        if buffer is None:
+            return Gst.FlowReturn.OK
+
+        caps = sample.get_caps()
+        if caps is not None:
+            caps_string = caps.to_string()
+            if caps_string != self.viewer_raw_caps_string:
+                raw_src.set_property("caps", caps.copy())
+                self.viewer_raw_caps_string = caps_string
+                print(f"[media] viewer raw caps: {caps_string}", flush=True)
+
+        # Raw I420 frames are independent. A copied buffer gets a fresh viewer
+        # timeline; stale raw frames may be dropped by the viewer appsrc queue.
+        out_buffer = buffer.copy_deep()
+        out_buffer.pts = Gst.CLOCK_TIME_NONE
+        out_buffer.dts = Gst.CLOCK_TIME_NONE
+        out_buffer.duration = Gst.CLOCK_TIME_NONE
+        flow = raw_src.emit("push-buffer", out_buffer)
+        if flow != Gst.FlowReturn.OK:
+            self.viewer_push_failures += 1
+            self.loop.call_soon_threadsafe(
+                self._handle_viewer_push_failure,
+                viewer_id,
+                str(flow),
+            )
+        return Gst.FlowReturn.OK
+
+    def _handle_viewer_push_failure(self, viewer_id: str, flow: str) -> None:
+        if viewer_id != self.active_viewer:
+            return
+        self.viewer_error = f"viewer raw push failed: {flow}"
+        print(f"[media] {self.viewer_error}", flush=True)
+        self.stop_viewer(clear_error=False)
 
     def schedule_send(self, message: dict[str, Any]) -> None:
         if self.loop.is_closed():
@@ -409,8 +558,8 @@ class MediaBridge:
         if interesting:
             print(f"[media] {label}: {' | '.join(interesting)}", flush=True)
 
-    def on_ice_candidate(self, _element: Gst.Element, mlineindex: int, candidate: str) -> None:
-        if not self.active_viewer:
+    def on_ice_candidate(self, element: Gst.Element, mlineindex: int, candidate: str) -> None:
+        if element is not self.webrtc or not self.active_viewer:
             return
         self.schedule_send(
             {
@@ -422,11 +571,12 @@ class MediaBridge:
         )
 
     def configure_h264_codec_preferences(self) -> None:
-        if self.webrtc is None or self.source_profile_level_id is None:
+        if self.webrtc is None or self.viewer_profile_level_id is None:
             return
         transceiver = self.webrtc.emit("get-transceiver", 0)
         if transceiver is None:
-            print("[media] 未找到 WebRTC video transceiver，跳过 H.264 profile preference", flush=True)
+            self.viewer_error = "未找到 WebRTC video transceiver"
+            print(f"[media] {self.viewer_error}", flush=True)
             return
 
         fields = [
@@ -437,127 +587,78 @@ class MediaBridge:
             "payload=(int)96",
             "packetization-mode=(string)1",
             "level-asymmetry-allowed=(string)1",
-            f"profile-level-id=(string){self.source_profile_level_id}",
+            f"profile-level-id=(string){self.viewer_profile_level_id}",
         ]
-        if self.source_sps_b64 and self.source_pps_b64:
+        if self.viewer_sps_b64 and self.viewer_pps_b64:
             fields.append(
-                f'sprop-parameter-sets=(string)"{self.source_sps_b64},{self.source_pps_b64}"'
+                f'sprop-parameter-sets=(string)"{self.viewer_sps_b64},{self.viewer_pps_b64}"'
             )
         caps = Gst.Caps.from_string(",".join(fields))
         transceiver.set_property("codec-preferences", caps)
-        self.offer_profile_level_id = self.source_profile_level_id
+        self.offer_profile_level_id = self.viewer_profile_level_id
         print(
             f"[media] WebRTC H.264 codec preference profile-level-id={self.offer_profile_level_id}",
             flush=True,
         )
 
-    async def _offer_after_timeout(self) -> None:
-        try:
-            await asyncio.sleep(OFFER_PROFILE_WAIT_SECONDS)
-            self._maybe_create_offer(True)
-        except asyncio.CancelledError:
-            raise
-        finally:
-            self.offer_timeout_task = None
-
-    def _maybe_create_offer(self, force: bool = False) -> None:
+    def _maybe_create_offer(self) -> None:
         if self.webrtc is None or not self.active_viewer or not self.offer_pending:
             return
-        if self.offer_in_progress:
+        if self.offer_in_progress or self.viewer_profile_level_id is None:
             return
 
-        if self.source_profile_level_id is None and not force:
-            if self.offer_timeout_task is None:
-                self.offer_timeout_task = asyncio.create_task(self._offer_after_timeout())
+        self.configure_h264_codec_preferences()
+        if self.viewer_error:
             return
 
-        if self.offer_timeout_task is not None:
-            self.offer_timeout_task.cancel()
-            self.offer_timeout_task = None
-
-        if self.source_profile_level_id is not None:
-            self.configure_h264_codec_preferences()
-        else:
-            print(
-                "[media] 等待源 SPS 超时，使用通用 H.264 codec preference 生成 offer",
-                flush=True,
-            )
-
+        viewer_id = self.active_viewer
+        element = self.webrtc
         self.offer_pending = False
         self.offer_in_progress = True
-        promise = Gst.Promise.new_with_change_func(self.on_offer_created, self.webrtc, None)
-        self.webrtc.emit("create-offer", None, promise)
+        promise = Gst.Promise.new_with_change_func(self.on_offer_created, element, viewer_id)
+        element.emit("create-offer", None, promise)
 
     def _offer_finished(self) -> None:
         self.offer_in_progress = False
 
-    def on_offer_created(self, promise: Gst.Promise, _element: Gst.Element, _data: Any) -> None:
+    def on_offer_created(self, promise: Gst.Promise, element: Gst.Element, viewer_id: Any) -> None:
         self.loop.call_soon_threadsafe(self._offer_finished)
-        if self.webrtc is None or not self.active_viewer:
+        if (
+            element is not self.webrtc
+            or not isinstance(viewer_id, str)
+            or viewer_id != self.active_viewer
+        ):
             return
         promise.wait()
         reply = promise.get_reply()
         offer = reply.get_value("offer") if reply is not None else None
         if offer is None:
-            self.last_error = "webrtcbin 未生成 SDP offer"
+            self.viewer_error = "webrtcbin 未生成 SDP offer"
             return
         offer_text = offer.sdp.as_text()
         self.log_sdp_video("SDP offer video", offer_text)
-        self.webrtc.emit("set-local-description", offer, Gst.Promise.new())
+        element.emit("set-local-description", offer, Gst.Promise.new())
         self.schedule_send(
             {
                 "type": "webrtc.offer",
-                "viewer_id": self.active_viewer,
+                "viewer_id": viewer_id,
                 "sdp": offer_text,
             }
         )
-        print(f"[media] 已向 viewer {self.active_viewer} 发送 SDP offer", flush=True)
+        print(f"[media] 已向 viewer {viewer_id} 发送 SDP offer", flush=True)
 
-    def on_negotiation_needed(self, _element: Gst.Element) -> None:
-        if not self.active_viewer:
+    def on_negotiation_needed(self, element: Gst.Element) -> None:
+        if element is not self.webrtc or not self.active_viewer:
             return
         self.offer_pending = True
-        self.loop.call_soon_threadsafe(self._maybe_create_offer, False)
+        self.loop.call_soon_threadsafe(self._maybe_create_offer)
 
-    def stop_peer(self) -> None:
-        if self.offer_timeout_task is not None:
-            self.offer_timeout_task.cancel()
-            self.offer_timeout_task = None
-        if self.pipeline is not None:
-            self.pipeline.set_state(Gst.State.NULL)
-        self.pipeline = None
-        self.webrtc = None
-        self.au_src = None
-        self.active_viewer = None
-        self.last_video_at = None
-        self.last_error = None
-        self.buffers = 0
-        self.bytes = 0
-        self.input_fps = 0.0
-        self.input_mbps = 0.0
-        self.rate_sample_at = time.monotonic()
-        self.rate_sample_buffers = 0
-        self.rate_sample_bytes = 0
-        self.retimed_au_buffers = 0
-        self.retime_push_failures = 0
-        self.source_idr_count = 0
-        self.source_sps_count = 0
-        self.source_pps_count = 0
-        self.source_profile_level_id = None
-        self.source_sps_b64 = None
-        self.source_pps_b64 = None
-        self.offer_profile_level_id = None
-        self.last_idr_at = None
-        self.force_key_unit_events = 0
-        self.offer_pending = False
-        self.offer_in_progress = False
-        self.reset_clock_metrics()
+    def start_source(self) -> None:
+        if self.source_pipeline is not None:
+            return
 
-    def start_peer(self, viewer_id: str) -> None:
-        self.stop_peer()
-        self.active_viewer = viewer_id
-        self.last_error = None
-
+        self.source_error = None
+        self.reset_source_metrics()
         description = (
             f'udpsrc name=rtpin port={self.video_port} '
             'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
@@ -568,32 +669,28 @@ class MediaBridge:
             '! appsink name=au_sink emit-signals=true sync=false max-buffers=4 drop=false '
             'appsrc name=au_src is-live=true format=time do-timestamp=true block=false '
             'caps="video/x-h264,stream-format=byte-stream,alignment=au" '
-            '! h264parse name=parser config-interval=1 '
+            '! h264parse name=retime_parser config-interval=1 '
             '! video/x-h264,stream-format=byte-stream,alignment=au '
-            '! rtph264pay name=pay pt=96 mtu=1200 config-interval=1 aggregate-mode=none '
-            '! application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96,packetization-mode=(string)1 '
-            '! webrtcbin name=webrtc bundle-policy=max-bundle'
+            '! avdec_h264 name=decoder '
+            '! videoconvert '
+            '! video/x-raw,format=I420 '
+            '! appsink name=raw_sink emit-signals=true sync=false max-buffers=2 drop=true'
         )
         pipeline = Gst.parse_launch(description)
         if not isinstance(pipeline, Gst.Pipeline):
-            raise RuntimeError("无法创建 GStreamer WebRTC pipeline")
+            raise RuntimeError("无法创建 persistent source pipeline")
 
-        self.pipeline = pipeline
-        self.webrtc = pipeline.get_by_name("webrtc")
-        self.au_src = pipeline.get_by_name("au_src")
+        au_src = pipeline.get_by_name("au_src")
         rtpin = pipeline.get_by_name("rtpin")
         au_sink = pipeline.get_by_name("au_sink")
-        parser = pipeline.get_by_name("parser")
-        pay = pipeline.get_by_name("pay")
-        if (
-            self.webrtc is None
-            or self.au_src is None
-            or rtpin is None
-            or au_sink is None
-            or parser is None
-            or pay is None
-        ):
-            raise RuntimeError("WebRTC pipeline 缺少必要元素")
+        parser = pipeline.get_by_name("retime_parser")
+        raw_sink = pipeline.get_by_name("raw_sink")
+        if any(element is None for element in (au_src, rtpin, au_sink, parser, raw_sink)):
+            pipeline.set_state(Gst.State.NULL)
+            raise RuntimeError("persistent source pipeline 缺少必要元素")
+
+        self.source_pipeline = pipeline
+        self.au_src = au_src
 
         input_pad = rtpin.get_static_pad("src")
         if input_pad is not None:
@@ -601,24 +698,117 @@ class MediaBridge:
         parser_pad = parser.get_static_pad("src")
         if parser_pad is not None:
             parser_pad.add_probe(Gst.PadProbeType.BUFFER, self.on_retimed_video_buffer)
+        au_sink.connect("new-sample", self.on_au_sample)
+        raw_sink.connect("new-sample", self.on_raw_sample)
+
+        result = pipeline.set_state(Gst.State.PLAYING)
+        if result == Gst.StateChangeReturn.FAILURE:
+            self.source_pipeline = None
+            self.au_src = None
+            pipeline.set_state(Gst.State.NULL)
+            raise RuntimeError("persistent source pipeline 启动失败")
+
+        print(
+            f"[media] source pipeline 已启动，RTP reorder={self.jitter_latency_ms}ms，"
+            "drop-on-latency=off，decode=avdec_h264",
+            flush=True,
+        )
+
+    def stop_source(self, clear_error: bool = True) -> None:
+        pipeline = self.source_pipeline
+        self.source_pipeline = None
+        self.au_src = None
+        if pipeline is not None:
+            pipeline.set_state(Gst.State.NULL)
+        if clear_error:
+            self.source_error = None
+
+    def start_viewer(self, viewer_id: str) -> None:
+        self.stop_viewer()
+        self.viewer_error = None
+        self.reset_viewer_metrics()
+
+        if Gst.ElementFactory.find("x264enc") is None:
+            self.viewer_error = "缺少 GStreamer x264enc，请安装 gstreamer1.0-plugins-ugly"
+            raise RuntimeError(self.viewer_error)
+
+        description = (
+            'appsrc name=raw_src is-live=true format=time do-timestamp=true block=false '
+            'max-buffers=2 leaky-type=downstream '
+            '! videoconvert '
+            '! video/x-raw,format=I420 '
+            '! x264enc name=encoder tune=zerolatency speed-preset=ultrafast '
+            'bframes=0 key-int-max=60 bitrate=6000 '
+            '! h264parse name=viewer_parser config-interval=-1 '
+            '! video/x-h264,stream-format=byte-stream,alignment=au '
+            '! rtph264pay name=pay pt=96 mtu=1200 config-interval=-1 aggregate-mode=none '
+            '! application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,'
+            'payload=96,packetization-mode=(string)1 '
+            '! webrtcbin name=webrtc bundle-policy=max-bundle'
+        )
+        pipeline = Gst.parse_launch(description)
+        if not isinstance(pipeline, Gst.Pipeline):
+            raise RuntimeError("无法创建 viewer pipeline")
+
+        raw_src = pipeline.get_by_name("raw_src")
+        webrtc = pipeline.get_by_name("webrtc")
+        parser = pipeline.get_by_name("viewer_parser")
+        pay = pipeline.get_by_name("pay")
+        if any(element is None for element in (raw_src, webrtc, parser, pay)):
+            pipeline.set_state(Gst.State.NULL)
+            raise RuntimeError("viewer pipeline 缺少必要元素")
+
+        self.viewer_pipeline = pipeline
+        self.raw_src = raw_src
+        self.webrtc = webrtc
+        self.active_viewer = viewer_id
+
+        parser_pad = parser.get_static_pad("src")
+        if parser_pad is not None:
+            parser_pad.add_probe(Gst.PadProbeType.BUFFER, self.on_viewer_h264_buffer)
         output_pad = pay.get_static_pad("src")
         if output_pad is not None:
             output_pad.add_probe(Gst.PadProbeType.BUFFER, self.on_output_rtp)
         pay_sink_pad = pay.get_static_pad("sink")
         if pay_sink_pad is not None:
-            pay_sink_pad.add_probe(Gst.PadProbeType.EVENT_UPSTREAM, self.on_force_key_unit_event)
-        au_sink.connect("new-sample", self.on_au_sample)
+            pay_sink_pad.add_probe(
+                Gst.PadProbeType.EVENT_UPSTREAM,
+                self.on_viewer_force_key_unit_event,
+            )
 
-        self.webrtc.connect("on-negotiation-needed", self.on_negotiation_needed)
-        self.webrtc.connect("on-ice-candidate", self.on_ice_candidate)
+        webrtc.connect("on-negotiation-needed", self.on_negotiation_needed)
+        webrtc.connect("on-ice-candidate", self.on_ice_candidate)
 
         result = pipeline.set_state(Gst.State.PLAYING)
         if result == Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError("GStreamer WebRTC pipeline 启动失败")
+            self.viewer_pipeline = None
+            self.raw_src = None
+            self.webrtc = None
+            self.active_viewer = None
+            pipeline.set_state(Gst.State.NULL)
+            raise RuntimeError("viewer pipeline 启动失败")
+
         print(
-            f"[media] viewer {viewer_id} 已连接，RTP reorder={self.jitter_latency_ms}ms，drop-on-latency=off，retime=h264-au-arrival-clock，AU drop=off",
+            f"[media] viewer {viewer_id} 已连接，encoder=x264enc，key-int-max=60",
             flush=True,
         )
+
+    def stop_viewer(self, clear_error: bool = True) -> None:
+        pipeline = self.viewer_pipeline
+        old_viewer = self.active_viewer
+        self.viewer_pipeline = None
+        self.webrtc = None
+        self.raw_src = None
+        self.active_viewer = None
+        self.viewer_raw_caps_string = None
+        self.offer_pending = False
+        self.offer_in_progress = False
+        if pipeline is not None:
+            pipeline.set_state(Gst.State.NULL)
+        if clear_error:
+            self.viewer_error = None
+        if old_viewer is not None:
+            print(f"[media] viewer {old_viewer} pipeline 已停止，source 保持运行", flush=True)
 
     def apply_answer(self, sdp_text: str) -> None:
         if self.webrtc is None:
@@ -645,13 +835,13 @@ class MediaBridge:
 
         if message_type == "viewer.connected" and isinstance(viewer_id, str):
             try:
-                self.start_peer(viewer_id)
+                self.start_viewer(viewer_id)
             except Exception as exc:
-                self.last_error = str(exc)
-                print(f"[media] 创建 WebRTC peer 失败: {exc}", flush=True)
+                self.viewer_error = str(exc)
+                print(f"[media] 创建 viewer pipeline 失败: {exc}", flush=True)
         elif message_type == "viewer.disconnected" and viewer_id == self.active_viewer:
             print(f"[media] viewer {viewer_id} 已断开", flush=True)
-            self.stop_peer()
+            self.stop_viewer()
         elif message_type == "webrtc.answer" and viewer_id == self.active_viewer:
             sdp = message.get("sdp")
             if isinstance(sdp, str):
@@ -674,7 +864,6 @@ class MediaBridge:
                 ) as websocket:
                     self.websocket = websocket
                     self.signaling_connected = True
-                    self.last_error = None
                     print("[media] WebRTC 信令已连接", flush=True)
                     async for raw in websocket:
                         await self.handle_message(raw)
@@ -685,23 +874,32 @@ class MediaBridge:
             finally:
                 self.websocket = None
                 self.signaling_connected = False
-                self.stop_peer()
+                # Signaling/browser lifetime is independent from AirPlay ingest.
+                self.stop_viewer()
                 self.write_status()
             if self.running:
                 await asyncio.sleep(2)
 
     async def run(self) -> None:
         print(
-            f"[media] CastBridge Media Bridge 启动，video RTP={self.video_port}，reorder={self.jitter_latency_ms}ms，drop-on-latency=off，retime=h264-au-arrival-clock，AU drop=off",
+            f"[media] CastBridge Media Bridge 启动，video RTP={self.video_port}，"
+            f"reorder={self.jitter_latency_ms}ms，source=persistent，viewer=x264enc",
             flush=True,
         )
+        try:
+            self.start_source()
+        except Exception as exc:
+            self.source_error = str(exc)
+            print(f"[media] source pipeline 启动失败: {exc}", flush=True)
+
         status_task = asyncio.create_task(self.status_loop())
         try:
             await self.signaling_loop()
         finally:
             self.running = False
             status_task.cancel()
-            self.stop_peer()
+            self.stop_viewer()
+            self.stop_source(clear_error=False)
             self.write_status()
             try:
                 await status_task
