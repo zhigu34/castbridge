@@ -39,11 +39,19 @@ type Media = {
   video_rtp_port: number | null
   jitter_latency_ms?: number | null
   retime_mode?: string | null
+  source_pipeline_active?: boolean
+  viewer_encoder?: string | null
+  viewer_encoded_idr_count?: number | null
+  viewer_force_key_unit_events?: number | null
+  viewer_push_failures?: number | null
   retimed_au_buffers?: number | null
   retime_push_failures?: number | null
   source_idr_count?: number | null
   source_sps_count?: number | null
   source_pps_count?: number | null
+  source_profile_level_id?: string | null
+  viewer_profile_level_id?: string | null
+  offer_profile_level_id?: string | null
   last_idr_age_seconds?: number | null
   force_key_unit_events?: number | null
   input_fps?: number | null
@@ -199,28 +207,35 @@ const streamStateText = computed(() => {
   if (webrtcState.value === 'connected' && framesDecoded.value > 0) return 'WebRTC 视频已解码'
   if (webrtcState.value === 'connected' && packetsReceived.value > 0) return '已收到 WebRTC RTP，但浏览器尚未解码 H.264'
   if (webrtcState.value === 'connected') return 'WebRTC 已连接，等待视频包'
-  if (media.value?.streaming) return 'H.264 视频流已到达 Media Bridge'
+  if (media.value?.streaming) return 'AirPlay 视频正在通过本地编码器转发'
+  if (media.value?.video_active && media.value?.source_pipeline_active) return 'AirPlay 视频源活跃，等待浏览器'
   if (media.value?.active_viewer) return '正在协商 WebRTC'
+  if (media.value?.source_pipeline_active) return 'Media Bridge 源管线常驻，等待 AirPlay / 浏览器'
   if (media.value?.healthy) return '等待浏览器视频会话'
   return media.value?.message || 'Media Bridge 检测中'
 })
 const diagnosticHint = computed(() => {
   const sourceIdrCount = media.value?.source_idr_count ?? 0
-  const forceKeyUnitEvents = media.value?.force_key_unit_events ?? 0
-  const lastIdrAge = media.value?.last_idr_age_seconds
+  const viewerIdrCount = media.value?.viewer_encoded_idr_count ?? 0
+  const viewerForceKeyUnit = media.value?.viewer_force_key_unit_events ?? 0
+  const viewerPushFailures = media.value?.viewer_push_failures ?? 0
+
+  if (viewerPushFailures > 0) {
+    return `本地 viewer raw push 已失败 ${viewerPushFailures} 次，源管线仍应保持运行`
+  }
 
   if (webrtcState.value === 'connected' && packetsReceived.value > 0 && framesDecoded.value <= 1 && pliCount.value >= 20) {
-    if (sourceIdrCount <= 1 && forceKeyUnitEvents > 0) {
-      return `浏览器持续请求关键帧（PLI ${pliCount.value}），Bridge 已收到 ${forceKeyUnitEvents} 次 ForceKeyUnit，但源端 IDR 仅 ${sourceIdrCount} 个`
+    if (viewerIdrCount === 0) {
+      return `浏览器持续请求关键帧（PLI ${pliCount.value}），但本地 x264enc 尚未产生 IDR；源端 IDR ${sourceIdrCount} 个`
     }
-    if (sourceIdrCount > 1) {
-      return `源端已出现 ${sourceIdrCount} 个 IDR，但浏览器仍无法恢复解码，优先检查 AU 完整性 / SPS-PPS / RTP 封装`
+    if (viewerForceKeyUnit > 0) {
+      return `浏览器 PLI ${pliCount.value}，本地 x264enc 已产生 ${viewerIdrCount} 个 IDR并收到 ${viewerForceKeyUnit} 次 ForceKeyUnit，但浏览器仍未恢复，检查 WebRTC RTP / SDP`
     }
-    return `浏览器持续请求关键帧（PLI ${pliCount.value}），当前源端 IDR ${sourceIdrCount} 个${lastIdrAge == null ? '' : `，最近 IDR ${lastIdrAge.toFixed(1)}s 前`}`
+    return `本地 x264enc 已产生 ${viewerIdrCount} 个 IDR，但浏览器仍未恢复解码，检查 WebRTC RTP / SDP`
   }
 
   if (webrtcState.value === 'connected' && packetsReceived.value > 0 && framesDecoded.value === 0) {
-    return 'RTP 已到达，但 H.264 尚未产生解码帧'
+    return 'RTP 已到达，但本地编码后的 H.264 尚未产生浏览器解码帧'
   }
   if (packetLossPercent.value >= 1) return '网络丢包偏高，优先检查 Wi-Fi / LAN 链路'
   if (jitterBufferMs.value >= 120) return '浏览器 jitter buffer 偏高，存在明显播放缓存'
@@ -237,19 +252,20 @@ const diagnosticHint = computed(() => {
     return `AU 重建后的 Parser PTS 速度异常：${parserClock.toFixed(3)}×`
   }
   if (parserClock > 0 && Math.abs(parserClock - 1) <= 0.08 && outputClock > 0 && Math.abs(outputClock - 1) > 0.08) {
-    return `Parser PTS 正常，但 Media Bridge 输出 RTP 时钟异常：${outputClock.toFixed(3)}×`
+    return `Parser PTS 正常，但本地编码器输出 RTP 时钟异常：${outputClock.toFixed(3)}×`
   }
   if (mediaTimeRate.value > 0 && Math.abs(mediaTimeRate.value - 1) > 0.08) {
     return `浏览器 video.currentTime 推进异常：${mediaTimeRate.value.toFixed(3)}× 实时`
   }
 
   const inputFps = media.value?.input_fps ?? 0
-  if (inputFps > 0 && inputFps < 50) return `Media Bridge 输入约 ${inputFps.toFixed(1)} FPS，上游帧率未达到 60 FPS`
-  if (inputFps >= 50 && receiveFps.value > 0 && receiveFps.value + 8 < inputFps) return 'Media Bridge 输入正常，但浏览器接收帧率明显偏低'
+  if (inputFps > 0 && receiveFps.value > 0 && receiveFps.value + 8 < inputFps) return 'Media Bridge 输入正常，但浏览器接收帧率明显偏低'
   if (receiveFps.value >= 30 && decodeFps.value + 8 < receiveFps.value) return 'WebRTC 已收到视频帧，但浏览器解码速度明显落后'
   if (decodeFps.value >= 30 && presentedFps.value > 0 && presentedFps.value + 8 < decodeFps.value) return '浏览器已解码，但实际呈现帧率明显落后'
   if (decodeFps.value > 0 && decodeFps.value < 20) return '解码帧率偏低'
-  if (webrtcState.value === 'connected' && framesDecoded.value > 0) return '视频链路工作中，重点观察源 IDR、ForceKeyUnit、PLI 与 AU retime 是否同步'
+  if (webrtcState.value === 'connected' && framesDecoded.value > 0) {
+    return `视频链路工作中；source 常驻，本地 ${media.value?.viewer_encoder ?? 'x264enc'} 已输出 ${viewerIdrCount} 个 IDR`
+  }
   return '等待 WebRTC 视频统计'
 })
 const diagnosticText = computed(() => JSON.stringify({
@@ -267,6 +283,14 @@ const diagnosticText = computed(() => JSON.stringify({
     state: media.value?.state ?? null,
     peer_state: media.value?.peer_state ?? null,
     streaming: media.value?.streaming ?? false,
+    source_pipeline_active: media.value?.source_pipeline_active ?? false,
+    viewer_encoder: media.value?.viewer_encoder ?? null,
+    viewer_encoded_idr_count: media.value?.viewer_encoded_idr_count ?? 0,
+    viewer_force_key_unit_events: media.value?.viewer_force_key_unit_events ?? 0,
+    viewer_push_failures: media.value?.viewer_push_failures ?? 0,
+    source_profile_level_id: media.value?.source_profile_level_id ?? null,
+    viewer_profile_level_id: media.value?.viewer_profile_level_id ?? null,
+    offer_profile_level_id: media.value?.offer_profile_level_id ?? null,
     buffers: media.value?.buffers ?? 0,
     bytes: media.value?.bytes ?? 0,
     jitter_latency_ms: media.value?.jitter_latency_ms ?? null,
@@ -741,6 +765,7 @@ onBeforeUnmount(() => {
         <article><span>接收器名称</span><strong>{{ receiver?.receiver_name ?? ready?.receiver ?? 'CastBridge' }}</strong></article>
         <article><span>AirPlay Receiver</span><strong>{{ receiver?.healthy ? '正常' : '未就绪' }}</strong></article>
         <article><span>Media Bridge</span><strong>{{ media?.healthy ? media.engine : '未就绪' }}</strong></article>
+        <article><span>源管线</span><strong>{{ media?.source_pipeline_active ? '常驻运行' : '未运行' }}</strong></article>
         <article><span>视频 RTP</span><strong>{{ media?.video_active ? `活跃 · ${media.buffers} buffers` : `${receiver?.video_rtp_port ?? 5000} · 等待` }}</strong></article>
         <article><span>浏览器接收</span><strong>{{ packetsReceived }} pkt · {{ Math.round(bytesReceived / 1024) }} KiB</strong></article>
         <article><span>浏览器解码</span><strong>{{ framesDecoded }} frames · {{ frameSize }}</strong></article>
@@ -764,9 +789,11 @@ onBeforeUnmount(() => {
           <article><span>解码 FPS</span><strong>{{ decodeFps.toFixed(1) }}</strong></article>
           <article><span>实际呈现 FPS</span><strong>{{ presentedFps.toFixed(1) }}</strong></article>
           <article><span>源 IDR</span><strong>{{ media?.source_idr_count ?? 0 }}</strong></article>
+          <article><span>本地编码 IDR</span><strong>{{ media?.viewer_encoded_idr_count ?? 0 }}</strong></article>
           <article><span>源 SPS / PPS</span><strong>{{ media?.source_sps_count ?? 0 }} / {{ media?.source_pps_count ?? 0 }}</strong></article>
-          <article><span>最近 IDR</span><strong>{{ media?.last_idr_age_seconds == null ? '—' : `${media.last_idr_age_seconds.toFixed(1)}s 前` }}</strong></article>
-          <article><span>ForceKeyUnit</span><strong>{{ media?.force_key_unit_events ?? 0 }}</strong></article>
+          <article><span>最近源 IDR</span><strong>{{ media?.last_idr_age_seconds == null ? '—' : `${media.last_idr_age_seconds.toFixed(1)}s 前` }}</strong></article>
+          <article><span>Viewer ForceKeyUnit</span><strong>{{ media?.viewer_force_key_unit_events ?? 0 }}</strong></article>
+          <article><span>Viewer Push Fail</span><strong>{{ media?.viewer_push_failures ?? 0 }}</strong></article>
           <article><span>输入 RTP 时钟</span><strong>{{ (media?.input_rtp_clock_ratio ?? 0).toFixed(3) }}×</strong></article>
           <article><span>Parser PTS 时钟</span><strong>{{ (media?.parser_pts_clock_ratio ?? 0).toFixed(3) }}×</strong></article>
           <article><span>输出 RTP 时钟</span><strong>{{ (media?.output_rtp_clock_ratio ?? 0).toFixed(3) }}×</strong></article>
@@ -788,6 +815,9 @@ onBeforeUnmount(() => {
           <span><b>Codec</b>{{ codecDescription }}</span>
           <span><b>Decoder</b>{{ decoderImplementation }}{{ powerEfficientDecoder === null ? '' : powerEfficientDecoder ? ' · HW/高效' : ' · 非高效' }}</span>
           <span><b>ICE</b>{{ icePath }}</span>
+          <span><b>Source</b>{{ media?.source_pipeline_active ? 'persistent' : 'stopped' }} · {{ media?.source_profile_level_id ?? 'profile ?' }}</span>
+          <span><b>Viewer Encoder</b>{{ media?.viewer_encoder ?? '—' }} · {{ media?.viewer_profile_level_id ?? 'profile ?' }}</span>
+          <span><b>SDP Offer Profile</b>{{ media?.offer_profile_level_id ?? '—' }}</span>
           <span><b>Media</b>{{ (media?.input_mbps ?? 0).toFixed(2) }} Mbps · jitter {{ media?.jitter_latency_ms ?? '—' }} ms</span>
           <span><b>AU retime</b>{{ media?.retimed_au_buffers ?? 0 }} ok · {{ media?.retime_push_failures ?? 0 }} fail</span>
           <span><b>RTP TS changes</b>{{ media?.input_rtp_timestamp_changes ?? 0 }} → {{ media?.output_rtp_timestamp_changes ?? 0 }}</span>
@@ -805,9 +835,10 @@ onBeforeUnmount(() => {
         <b>AirPlay</b>
         <span>UxPlay</span>
         <b>H.264 RTP</b>
-        <span>GStreamer Media Bridge</span>
-        <b>WebRTC</b>
-        <span>Browser Video</span>
+        <span>Persistent Decode</span>
+        <b>x264enc</b>
+        <span>WebRTC</span>
+        <b>Browser</b>
       </div>
     </section>
   </main>
