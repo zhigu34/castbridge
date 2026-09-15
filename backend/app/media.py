@@ -15,11 +15,19 @@ def load_media_status(status_file: Path, stale_seconds: int = 5) -> dict[str, An
         "video_rtp_port": None,
         "jitter_latency_ms": None,
         "retime_mode": None,
+        "source_pipeline_active": False,
+        "viewer_encoder": None,
+        "viewer_encoded_idr_count": 0,
+        "viewer_force_key_unit_events": 0,
+        "viewer_push_failures": 0,
         "retimed_au_buffers": 0,
         "retime_push_failures": 0,
         "source_idr_count": 0,
         "source_sps_count": 0,
         "source_pps_count": 0,
+        "source_profile_level_id": None,
+        "viewer_profile_level_id": None,
+        "offer_profile_level_id": None,
         "last_idr_age_seconds": None,
         "force_key_unit_events": 0,
         "input_fps": 0.0,
@@ -57,21 +65,25 @@ def load_media_status(status_file: Path, stale_seconds: int = 5) -> dict[str, An
 
     state = str(raw.get("state") or "unknown")
     fresh = age_seconds is not None and age_seconds <= stale_seconds
-    healthy = fresh and state in {"waiting", "negotiating", "streaming"}
-    streaming = healthy and bool(raw.get("video_active"))
+    healthy = fresh and state in {"waiting", "negotiating", "streaming", "signaling_disconnected"}
+    video_active = bool(raw.get("video_active"))
+    active_viewer = raw.get("active_viewer")
+    streaming = healthy and video_active and bool(active_viewer)
 
     if not fresh:
         message = "Media Bridge 心跳已过期"
     elif state == "error":
         message = str(raw.get("error") or "Media Bridge 异常")
     elif streaming:
-        message = "H.264 RTP 正在通过 WebRTC 转发"
-    elif raw.get("active_viewer"):
-        message = "浏览器已连接，正在协商 WebRTC"
+        message = "AirPlay 视频正在通过本地 H.264 编码器和 WebRTC 转发"
+    elif video_active:
+        message = "AirPlay 视频源活跃，等待浏览器观看端"
+    elif active_viewer:
+        message = "浏览器已连接，等待 AirPlay 视频源 / WebRTC 协商"
     elif raw.get("signaling_connected"):
         message = "Media Bridge 已就绪，等待浏览器"
     else:
-        message = "Media Bridge 等待信令连接"
+        message = "Media Bridge source pipeline 已就绪，等待信令连接"
 
     return {
         "healthy": healthy,
@@ -83,11 +95,19 @@ def load_media_status(status_file: Path, stale_seconds: int = 5) -> dict[str, An
         "video_rtp_port": raw.get("video_rtp_port"),
         "jitter_latency_ms": raw.get("jitter_latency_ms"),
         "retime_mode": raw.get("retime_mode"),
+        "source_pipeline_active": bool(raw.get("source_pipeline_active")),
+        "viewer_encoder": raw.get("viewer_encoder"),
+        "viewer_encoded_idr_count": int(raw.get("viewer_encoded_idr_count") or 0),
+        "viewer_force_key_unit_events": int(raw.get("viewer_force_key_unit_events") or 0),
+        "viewer_push_failures": int(raw.get("viewer_push_failures") or 0),
         "retimed_au_buffers": int(raw.get("retimed_au_buffers") or 0),
         "retime_push_failures": int(raw.get("retime_push_failures") or 0),
         "source_idr_count": int(raw.get("source_idr_count") or 0),
         "source_sps_count": int(raw.get("source_sps_count") or 0),
         "source_pps_count": int(raw.get("source_pps_count") or 0),
+        "source_profile_level_id": raw.get("source_profile_level_id"),
+        "viewer_profile_level_id": raw.get("viewer_profile_level_id"),
+        "offer_profile_level_id": raw.get("offer_profile_level_id"),
         "last_idr_age_seconds": (
             float(raw["last_idr_age_seconds"])
             if isinstance(raw.get("last_idr_age_seconds"), (int, float))
@@ -103,9 +123,9 @@ def load_media_status(status_file: Path, stale_seconds: int = 5) -> dict[str, An
         "output_rtp_timestamp_changes": int(raw.get("output_rtp_timestamp_changes") or 0),
         "parser_pts_valid_buffers": int(raw.get("parser_pts_valid_buffers") or 0),
         "signaling_connected": bool(raw.get("signaling_connected")),
-        "active_viewer": raw.get("active_viewer"),
+        "active_viewer": active_viewer,
         "peer_state": raw.get("peer_state", "idle"),
-        "video_active": bool(raw.get("video_active")),
+        "video_active": video_active,
         "video_age_seconds": raw.get("video_age_seconds"),
         "buffers": int(raw.get("buffers") or 0),
         "bytes": int(raw.get("bytes") or 0),
